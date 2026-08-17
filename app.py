@@ -6,6 +6,7 @@ from datetime import datetime
 
 import numpy as np
 import pandas as pd
+import re
 import plotly.graph_objects as go
 import streamlit as st
 
@@ -324,8 +325,114 @@ def candidate_grade(score):
     return "低優先"
 
 
+
+def count_warrants_for_code(code, warrants_df, min_warrant_volume):
+    code = str(code).strip()
+    if warrants_df is None or warrants_df.empty or "underlying" not in warrants_df.columns:
+        return 0, 0
+    x = warrants_df.copy()
+    x["underlying"] = x["underlying"].fillna("").astype(str).str.strip()
+    x = x[x["underlying"] == code]
+    if "warrant_type" in x.columns:
+        calls = x[x["warrant_type"].fillna("CALL").eq("CALL")]
+    else:
+        calls = x
+    total_calls = len(calls)
+    if "volume" in calls.columns:
+        vol = pd.to_numeric(calls["volume"], errors="coerce").fillna(0)
+        active_calls = int((vol >= min_warrant_volume).sum())
+    else:
+        active_calls = 0
+    return total_calls, active_calls
+
+
+def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
+                   min_stock_volume, min_turnover_m, min_liquid_warrants,
+                   min_warrant_volume):
+    code = str(code).strip()
+    result = {
+        "股票代號": code,
+        "公司名稱": DYNAMIC_NAMES.get(code) or COMPANY_NAMES.get(code, ""),
+        "現股成交量(張)": None,
+        "現股成交金額(百萬元)": None,
+        "成交量門檻": "未知",
+        "成交金額門檻": "未知",
+        "認購權證數": 0,
+        "活躍認購權證數": 0,
+        "權證流動性門檻": "未知",
+        "正式預篩": "未進入",
+        "目前排名": None,
+        "機會分數": None,
+        "訊號類型": "",
+        "候選等級": "",
+        "盤中判斷": "",
+        "落選原因": "",
+    }
+
+    # 現股資料
+    if all_stocks is not None and not all_stocks.empty and "code" in all_stocks.columns:
+        s = all_stocks[all_stocks["code"].astype(str).str.strip() == code]
+        if not s.empty:
+            r = s.iloc[0]
+            vol = pd.to_numeric(r.get("volume_lots"), errors="coerce")
+            turn = pd.to_numeric(r.get("turnover"), errors="coerce")
+            result["公司名稱"] = str(r.get("name") or result["公司名稱"])
+            result["現股成交量(張)"] = None if pd.isna(vol) else float(vol)
+            result["現股成交金額(百萬元)"] = None if pd.isna(turn) else float(turn)/1_000_000
+            result["成交量門檻"] = "通過" if (not pd.isna(vol) and vol >= min_stock_volume) else "未通過"
+            result["成交金額門檻"] = "通過" if (not pd.isna(turn) and turn >= min_turnover_m*1_000_000) else "未通過"
+
+    # 權證資料
+    total_calls, active_calls = count_warrants_for_code(code, warrants_df, min_warrant_volume)
+    result["認購權證數"] = total_calls
+    result["活躍認購權證數"] = active_calls
+    result["權證流動性門檻"] = "通過" if active_calls >= min_liquid_warrants else "未通過"
+
+    # 正式預篩
+    if pool is not None and not pool.empty and "code" in pool.columns:
+        result["正式預篩"] = "已進入" if code in set(pool["code"].astype(str)) else "未進入"
+
+    # 排名與分數
+    if ranking is not None and not ranking.empty and "code" in ranking.columns:
+        rr = ranking.reset_index(drop=True)
+        m = rr[rr["code"].astype(str) == code]
+        if not m.empty:
+            idx = int(m.index[0])
+            row = m.iloc[0]
+            result["目前排名"] = idx + 1
+            result["機會分數"] = float(pd.to_numeric(row.get("score"), errors="coerce") or 0)
+            result["訊號類型"] = str(row.get("setup") or "")
+            result["候選等級"] = str(row.get("候選等級") or "")
+            result["盤中判斷"] = str(row.get("盤中判斷") or "")
+
+    # 落選原因：依優先順序組合
+    reasons = []
+    if result["成交量門檻"] == "未通過":
+        reasons.append(f"現股成交量低於 {min_stock_volume:,} 張")
+    if result["成交金額門檻"] == "未通過":
+        reasons.append(f"現股成交金額低於 {min_turnover_m:,} 百萬元")
+    if result["認購權證數"] == 0:
+        reasons.append("目前未成功對應到認購權證")
+    elif result["活躍認購權證數"] < min_liquid_warrants:
+        reasons.append(f"活躍認購權證少於 {min_liquid_warrants} 張")
+    if result["機會分數"] is None:
+        reasons.append("未進入深度評分候選池")
+    else:
+        if result["機會分數"] < 70:
+            reasons.append("機會分數未達今日推薦門檻 70 分")
+        if result["訊號類型"] in ["過熱・不追","弱勢觀察","資料錯誤","資料不足"]:
+            reasons.append(f"目前訊號為「{result['訊號類型']}」")
+        if result["盤中判斷"] == "🔴 急漲不追":
+            reasons.append("盤中漲幅過熱，系統判定不追價")
+        elif result["盤中判斷"] == "🟡 等止穩":
+            reasons.append("盤中仍偏弱，等待止穩確認")
+
+    result["落選原因"] = "；".join(reasons) if reasons else "目前條件大致通過，若仍未進榜，可能是排名被其他高分標的擠出。"
+    return result
+
+
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 v6.2｜權證關聯修正版")
+st.title("📡 個人版台股權證雷達 v6.3｜落選原因診斷版")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -338,7 +445,7 @@ if not all_stocks.empty:
     for _, r in all_stocks[["code","name"]].dropna().iterrows():
         DYNAMIC_NAMES[str(r["code"])] = str(r["name"])
 
-# V6.2：官方標的代號缺失時，由權證名稱前綴反推標的股票
+# V6.3：官方標的代號缺失時，由權證名稱前綴反推標的股票
 if not wbasic.empty and not all_stocks.empty:
     try:
         wbasic = infer_underlying_from_warrant_name(wbasic, all_stocks)
@@ -359,7 +466,7 @@ with st.expander("🩺 資料健康檢查", expanded=(health_ok < 3)):
         _total_w = len(wbasic)
         _linked_w = int(wbasic["underlying"].astype(str).str.fullmatch(r"\d{4}", na=False).sum()) if "underlying" in wbasic.columns else 0
         _call_w = int((wbasic["warrant_type"]=="CALL").sum()) if "warrant_type" in wbasic.columns else 0
-        st.caption(f"V6.2 權證關聯診斷：基本資料 {_total_w:,} 筆｜可辨識股票標的 {_linked_w:,} 筆｜認購權證 {_call_w:,} 筆")
+        st.caption(f"V6.3 權證關聯診斷：基本資料 {_total_w:,} 筆｜可辨識股票標的 {_linked_w:,} 筆｜認購權證 {_call_w:,} 筆")
 
 
 with st.sidebar:
@@ -415,6 +522,7 @@ if scan_mode:
         min_stock_volume, min_turnover_m,
         min_liquid_warrants, max_candidates
     )
+    strict_pool = pool.copy()
 
     fallback_used = False
     if pool.empty:
@@ -422,7 +530,7 @@ if scan_mode:
         pool = fallback_market_candidates(all_stocks, fallback_count)
         st.warning(
             "正式『有足夠活躍權證』預篩目前為 0 檔。"
-            "V6.2 已自動啟動保底候選池，因此下方仍會列出全市場高流動性股票進行評分。"
+            "V6.3 已自動啟動保底候選池，因此下方仍會列出全市場高流動性股票進行評分。"
             "保底候選不等於權證可直接買進，仍需到『權證排行』確認。"
         )
 
@@ -437,6 +545,7 @@ if scan_mode:
 else:
     fallback_used = False
     funnel_df = pd.DataFrame()
+    strict_pool = pd.DataFrame()
     with st.spinner("更新固定關注股…"):
         ranking = stock_ranking(watchlist)
 
@@ -531,6 +640,47 @@ ranking["盤中判斷"] = ranking.apply(
     lambda r: live_signal_text(float(r.get("score",0) or 0), str(r.get("setup","")),
                                pd.to_numeric(r.get("change_pct_live"), errors="coerce")), axis=1
 )
+
+
+# V6.3｜指定股票落選原因診斷
+st.subheader("🧪 指定股票診斷")
+diag_cols = st.columns([2,1])
+with diag_cols[0]:
+    diagnose_code = st.text_input("輸入股票代號", value="2376", max_chars=6, placeholder="例如：2376")
+with diag_cols[1]:
+    st.write("")
+    st.write("")
+    diagnose_btn = st.button("分析為什麼沒入選", use_container_width=True)
+
+if diagnose_btn or diagnose_code:
+    _dc = str(diagnose_code).strip()
+    if re.fullmatch(r"\d{4}", _dc):
+        _diag = diagnose_stock(
+            _dc, all_stocks, ranking, strict_pool, warrants,
+            min_stock_volume, min_turnover_m, min_liquid_warrants,
+            cfg["min_warrant_volume"]
+        )
+        d1,d2,d3,d4 = st.columns(4)
+        d1.metric("股票", f"{_diag['股票代號']} {_diag['公司名稱']}".strip())
+        d2.metric("目前排名", _diag["目前排名"] if _diag["目前排名"] is not None else "未排名")
+        d3.metric("機會分數", f"{_diag['機會分數']:.1f}" if _diag["機會分數"] is not None else "未評分")
+        d4.metric("活躍認購權證", f"{_diag['活躍認購權證數']} 張")
+
+        c1,c2,c3 = st.columns(3)
+        c1.metric("成交量門檻", _diag["成交量門檻"])
+        c2.metric("成交金額門檻", _diag["成交金額門檻"])
+        c3.metric("正式預篩", _diag["正式預篩"])
+
+        st.markdown(f"**訊號類型：** {_diag['訊號類型'] or '—'}　　**候選等級：** {_diag['候選等級'] or '—'}　　**盤中判斷：** {_diag['盤中判斷'] or '—'}")
+        st.info(f"**未進今日推薦的主要原因：** {_diag['落選原因']}")
+        st.caption(
+            f"現股成交量：{_diag['現股成交量(張)'] if _diag['現股成交量(張)'] is not None else '—'} 張｜"
+            f"成交金額：{_diag['現股成交金額(百萬元)']:.1f} 百萬元"
+            if _diag['現股成交金額(百萬元)'] is not None
+            else "成交金額：—"
+        )
+    elif _dc:
+        st.warning("請輸入四位數上市股票代號，例如 2376。")
 
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
