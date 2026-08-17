@@ -30,9 +30,11 @@
   "min_stock_turnover_million": 50,
   "min_liquid_warrants": 3,
   "max_deep_candidates": 60,
-  "recommend_score_min": 75,
-  "next_score_min": 62,
-  "version": "6.0",
+  "recommend_score_min": 70,
+  "next_score_min": 55,
+  "version": "6.1",
   "intraday_mode": true,
-  "live_top_n": 10
+  "live_top_n": 10,
+  "fallback_count": 30,
+  "show_funnel": true
 }
