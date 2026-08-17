@@ -24,5 +24,12 @@
   "preferred_delta_min": 0.35,
   "preferred_delta_max": 0.65,
   "first_entry_amount": 50000,
-  "reserve_amount": 50000
+  "reserve_amount": 50000,
+  "dynamic_scan": true,
+  "min_stock_volume_lots": 1000,
+  "min_stock_turnover_million": 50,
+  "min_liquid_warrants": 3,
+  "max_deep_candidates": 60,
+  "recommend_score_min": 75,
+  "next_score_min": 62
 }
