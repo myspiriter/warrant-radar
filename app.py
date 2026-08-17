@@ -432,7 +432,7 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 v6.3｜落選原因診斷版")
+st.title("📡 個人版台股權證雷達 V6.3")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池

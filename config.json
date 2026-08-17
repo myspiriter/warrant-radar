@@ -40,5 +40,5 @@
   "warrant_link_name_fallback": true,
   "warrant_daily_name_fallback": true,
   "diagnosis_enabled": true,
-  "diagnosis_default_code": "2376"
+  "diagnosis_default_code": ""
 }
