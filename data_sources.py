@@ -145,3 +145,72 @@ def merge_warrant_volume(terms: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFra
     cols=[c for c in ["warrant_code","volume","turnover","trade_date"] if c in daily.columns]
     d=daily[cols].drop_duplicates("warrant_code",keep="last")
     return x.drop(columns=["volume"],errors="ignore").merge(d,on="warrant_code",how="left")
+
+
+def twse_mis_quotes(codes, market="tse") -> pd.DataFrame:
+    """Best-effort quote overlay from TWSE Market Information System.
+    This is used only as a quote overlay; the strategy can still run if it is unavailable.
+    """
+    codes = [str(c).strip() for c in codes if str(c).strip()]
+    if not codes:
+        return pd.DataFrame()
+    # MIS accepts multiple exchange-channel symbols separated by |
+    ex_ch = "|".join([f"{market}_{c}.tw" for c in codes[:80]])
+    try:
+        js = _get_json(
+            "https://mis.twse.com.tw/stock/api/getStockInfo.jsp",
+            {"ex_ch": ex_ch, "json": "1", "delay": "0", "_": str(int(time.time()*1000))},
+            timeout=12,
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    rows = []
+    for r in js.get("msgArray", []) or []:
+        code = str(r.get("c") or "").strip()
+        if not code:
+            continue
+        def fnum(v):
+            try:
+                s = str(v).replace(",", "").strip()
+                if s in ("", "-", "--", "nan"):
+                    return None
+                return float(s)
+            except Exception:
+                return None
+        last = fnum(r.get("z"))
+        ref = fnum(r.get("y"))
+        open_ = fnum(r.get("o"))
+        high = fnum(r.get("h"))
+        low = fnum(r.get("l"))
+        volume = fnum(r.get("v"))
+        bid = None
+        ask = None
+        try:
+            b = str(r.get("b","")).split("_")[0]
+            bid = fnum(b)
+        except Exception:
+            pass
+        try:
+            a = str(r.get("a","")).split("_")[0]
+            ask = fnum(a)
+        except Exception:
+            pass
+        change_pct = ((last/ref)-1)*100 if last is not None and ref not in (None,0) else None
+        rows.append({
+            "code": code,
+            "name": str(r.get("n") or "").strip(),
+            "last": last,
+            "reference": ref,
+            "open_live": open_,
+            "high_live": high,
+            "low_live": low,
+            "volume_live": volume,
+            "bid": bid,
+            "ask": ask,
+            "change_pct_live": change_pct,
+            "quote_date": str(r.get("d") or ""),
+            "quote_time": str(r.get("t") or ""),
+            "source": "TWSE MIS",
+        })
+    return pd.DataFrame(rows)

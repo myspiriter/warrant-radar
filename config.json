@@ -31,5 +31,8 @@
   "min_liquid_warrants": 3,
   "max_deep_candidates": 60,
   "recommend_score_min": 75,
-  "next_score_min": 62
+  "next_score_min": 62,
+  "version": "6.0",
+  "intraday_mode": true,
+  "live_top_n": 10
 }

@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume
+from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 
 APP_DIR = Path(__file__).resolve().parent
@@ -34,11 +34,14 @@ def zh_stock_table(df: pd.DataFrame) -> pd.DataFrame:
     if "code" in x.columns:
         x["股票"] = x["code"].astype(str).map(stock_label)
     x = x.rename(columns={
-        "score":"機會分數", "setup":"訊號類型", "close":"收盤價",
-        "ret1_pct":"今日漲跌幅(%)", "ret5_pct":"近5日漲跌幅(%)",
-        "volume_ratio":"量比", "rsi14":"RSI強弱指標", "ma20":"20日均線"
+        "score":"機會分數", "setup":"訊號類型", "close":"前收/日線收盤價",
+        "ret1_pct":"日線漲跌幅(%)", "ret5_pct":"近5日漲跌幅(%)",
+        "volume_ratio":"日線量比", "rsi14":"RSI強弱指標", "ma20":"20日均線",
+        "last":"盤中成交價", "bid":"盤中委買", "ask":"盤中委賣",
+        "change_pct_live":"盤中漲跌幅(%)", "volume_live":"盤中累計量",
+        "quote_time":"行情時間"
     })
-    cols=[c for c in ["股票","機會分數","訊號類型","收盤價","今日漲跌幅(%)","近5日漲跌幅(%)","量比","RSI強弱指標","20日均線"] if c in x.columns]
+    cols=[c for c in ["股票","機會分數","盤中判斷","訊號類型","盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間","前收/日線收盤價","日線漲跌幅(%)","近5日漲跌幅(%)","日線量比","RSI強弱指標","20日均線"] if c in x.columns]
     return x[cols]
 
 def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -85,6 +88,35 @@ def load_warrant_basic():
         return twse_warrant_basic()
     except Exception:
         return pd.DataFrame()
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def load_live_quotes(codes_tuple):
+    try:
+        return twse_mis_quotes(list(codes_tuple))
+    except Exception:
+        return pd.DataFrame()
+
+def data_health(all_stocks, wb, wv):
+    rows=[]
+    rows.append(("上市股票日資料", not all_stocks.empty, len(all_stocks)))
+    rows.append(("權證基本資料", not wb.empty, len(wb)))
+    rows.append(("權證成交資料", not wv.empty, len(wv)))
+    ok=sum(1 for _,x,_ in rows if x)
+    return rows, ok
+
+def live_signal_text(score, setup, live_pct):
+    if live_pct is None or pd.isna(live_pct):
+        return "⚪ 等待盤中報價"
+    if score >= 75 and setup not in ["過熱・不追","弱勢觀察","資料不足","資料錯誤"]:
+        if -2.5 <= live_pct <= 3.5:
+            return "🟢 可觀察進場"
+        if live_pct > 5:
+            return "🔴 急漲不追"
+        return "🟡 等止穩"
+    if score >= 62:
+        return "🟡 NEXT 觀察"
+    return "⚪ 暫不進場"
 
 
 def load_cfg():
@@ -198,8 +230,8 @@ def dynamic_ranking(pool: pd.DataFrame):
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 v5.2")
-st.caption("全市場動態掃描 → 今日推薦 → 潛在標的 → 每檔最佳權證。資料來自 TWSE 公開資料；非即時逐筆行情，不構成投資建議。")
+st.title("📡 個人版台股權證雷達 v6｜盤中實戰版")
+st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
 with st.spinner("掃描全市場與權證流動性…"):
@@ -211,7 +243,26 @@ if not all_stocks.empty:
     for _, r in all_stocks[["code","name"]].dropna().iterrows():
         DYNAMIC_NAMES[str(r["code"])] = str(r["name"])
 
+
+health_rows, health_ok = data_health(all_stocks, wbasic, wvol)
+with st.expander("🩺 資料健康檢查", expanded=(health_ok < 3)):
+    h1,h2,h3 = st.columns(3)
+    for col,(label,ok,count) in zip([h1,h2,h3],health_rows):
+        col.metric(label, "正常" if ok else "異常/無資料", f"{count:,} 筆")
+    if health_ok < 3:
+        st.warning("部分公開資料源目前沒有回傳資料。v6 會降級運作，不會把『資料缺失』直接判定成『市場沒有機會』。")
+    else:
+        st.success("策略掃描所需的三組公開資料均已取得。")
+
 with st.sidebar:
+    st.header("V6 盤中模式")
+    intraday_mode = st.toggle("啟用盤中行情覆蓋", value=True)
+    live_top_n = st.slider("盤中更新前幾名候選", 3, 20, 10, step=1)
+    if st.button("🔄 立即刷新盤中行情", use_container_width=True):
+        load_live_quotes.clear()
+        st.rerun()
+    st.caption("盤中行情約每20秒可重新抓取；策略分數仍以較完整的日線資料計算，避免只看瞬間波動。")
+    st.divider()
     st.header("每日動態掃描")
     scan_mode = st.toggle("啟用全市場自動掃描", value=True)
     min_stock_volume = st.number_input("現股最低成交量（張）", 0, 1000000, 1000, step=500)
@@ -298,6 +349,30 @@ for _col, _default in required_ranking_cols.items():
         ranking[_col] = _default
 ranking["score"] = pd.to_numeric(ranking["score"], errors="coerce").fillna(0)
 ranking["setup"] = ranking["setup"].fillna("資料不足").astype(str)
+
+# V6 盤中行情覆蓋：只更新候選前 N 名，避免一次抓全市場造成延遲
+live_quotes = pd.DataFrame()
+if intraday_mode and not ranking.empty:
+    live_codes = tuple(ranking.head(live_top_n)["code"].astype(str).tolist())
+    live_quotes = load_live_quotes(live_codes)
+    if not live_quotes.empty:
+        ranking = ranking.merge(
+            live_quotes[["code","last","bid","ask","volume_live","change_pct_live","quote_date","quote_time"]],
+            on="code", how="left"
+        )
+    else:
+        for _c in ["last","bid","ask","volume_live","change_pct_live","quote_date","quote_time"]:
+            if _c not in ranking.columns:
+                ranking[_c] = pd.NA
+else:
+    for _c in ["last","bid","ask","volume_live","change_pct_live","quote_date","quote_time"]:
+        if _c not in ranking.columns:
+            ranking[_c] = pd.NA
+
+ranking["盤中判斷"] = ranking.apply(
+    lambda r: live_signal_text(float(r.get("score",0) or 0), str(r.get("setup","")),
+                               pd.to_numeric(r.get("change_pct_live"), errors="coerce")), axis=1
+)
 
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
