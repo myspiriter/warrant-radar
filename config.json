@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.4",
+  "version": "6.5",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -49,5 +49,7 @@
     "TWSE MI_INDEX JSON",
     "last-good cache"
   ],
-  "market_cache_ttl_seconds": 300
+  "market_cache_ttl_seconds": 300,
+  "stock_top_n": 3,
+  "warrant_top_n_per_stock": 5
 }

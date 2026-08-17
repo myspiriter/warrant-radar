@@ -457,7 +457,7 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.4")
+st.title("📡 個人版台股權證雷達 V6.5")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -851,31 +851,124 @@ with TAB_WATCH:
     st.dataframe(zh_stock_table(watch_ranking), width="stretch", hide_index=True)
 
 with TAB_WARRANT:
-    st.subheader("全權證排行")
-    if warrants.empty:
-        st.info("請上傳一份券商權證 CSV。只要有代號、標的、成交量、履約價、到期日，就能先做核心排行；Delta/IV/價差越完整越準。")
-        if not wvol.empty:
-            st.success(f"TWSE 每日權證成交量已成功抓到 {len(wvol):,} 筆。")
-            st.dataframe(zh_warrant_table(wvol.head(20)), width="stretch", hide_index=True)
+    st.subheader("🎯 個股推薦前三名＋各自權證前五名")
+    st.caption("先挑股票，再挑權證，避免單一股票的權證佔滿整張排行榜。")
+
+    _base_stock = ranking.copy()
+
+    if _base_stock.empty:
+        st.info("目前沒有可建立個股前三名的候選股票。")
     else:
-        all_ranked=[]
-        pmap = ranking.set_index("code")["close"].to_dict()
-        for code, p in pmap.items():
-            r=rank_warrants(warrants, code, float(p), cfg)
-            if not r.empty:
-                r["stock_code"] = code
-                r["stock_score"] = float(ranking.loc[ranking.code==code,"score"].iloc[0])
-                all_ranked.append(r)
-        if all_ranked:
-            aw=pd.concat(all_ranked, ignore_index=True)
-            aw["combo_score"] = aw["stock_score"]*0.45 + aw["warrant_score"]*0.55
-            aw=aw.sort_values(["eligible","combo_score"], ascending=[False,False])
-            cols=["stock_code","stock_score","warrant_code","warrant_name","issuer","volume","strike","days_to_expiry","otm_pct","delta","effective_leverage","spread_pct","iv","warrant_score","combo_score","eligible","filter_reason"]
-            aw_show = zh_warrant_table(aw[[c for c in cols if c in aw.columns]].head(50))
-            keep = [c for c in ["標的股票","現股分數","權證代號","權證名稱","發行券商","成交量(張)","履約價","剩餘天數","價外幅度(%)","Delta敏感度","有效槓桿(倍)","買賣價差(%)","隱含波動率IV(%)","權證分數","綜合分數","是否通過篩選","篩選結果"] if c in aw_show.columns]
-            st.dataframe(aw_show[keep], width="stretch", hide_index=True)
+        _base_stock["score"] = pd.to_numeric(_base_stock["score"], errors="coerce").fillna(0)
+        _base_stock = _base_stock.sort_values("score", ascending=False).reset_index(drop=True)
+
+        _formal = _base_stock[
+            (_base_stock["score"] >= 70) &
+            (~_base_stock["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足"]))
+        ].copy()
+
+        _selected_codes = []
+        for _c in _formal["code"].astype(str).tolist():
+            if _c not in _selected_codes:
+                _selected_codes.append(_c)
+            if len(_selected_codes) >= 3:
+                break
+
+        if len(_selected_codes) < 3:
+            for _c in _base_stock["code"].astype(str).tolist():
+                if _c not in _selected_codes:
+                    _selected_codes.append(_c)
+                if len(_selected_codes) >= 3:
+                    break
+
+        st.markdown("### 🏆 個股推薦 TOP 3")
+        _top3 = _base_stock[_base_stock["code"].astype(str).isin(_selected_codes)].copy()
+        _top3["_順序"] = _top3["code"].astype(str).map({c:i for i,c in enumerate(_selected_codes)})
+        _top3 = _top3.sort_values("_順序").drop(columns=["_順序"], errors="ignore")
+        st.dataframe(
+            zh_stock_table(_top3),
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "機會分數": st.column_config.ProgressColumn(
+                    "機會分數", min_value=0, max_value=100, format="%.1f"
+                )
+            }
+        )
+
+        if warrants is None or warrants.empty:
+            st.warning("目前沒有權證資料，因此暫時只能顯示個股前三名。")
         else:
-            st.warning("目前權證資料沒有對應追蹤清單內的標的。")
+            for _rank, _code in enumerate(_selected_codes, start=1):
+                _row = _base_stock[_base_stock["code"].astype(str) == str(_code)]
+                if _row.empty:
+                    continue
+                _row = _row.iloc[0]
+
+                _live = pd.to_numeric(_row.get("last"), errors="coerce")
+                _close = pd.to_numeric(_row.get("close"), errors="coerce")
+                _spot = float(_live if pd.notna(_live) else (_close if pd.notna(_close) else 0))
+
+                st.markdown(
+                    f"### {_rank}. {stock_label(_code)}｜現股分數 {float(_row.get('score',0)):.1f}"
+                )
+
+                _wr = rank_warrants(warrants, str(_code), _spot, cfg)
+
+                if _wr is None or _wr.empty:
+                    st.info(f"{stock_label(_code)}：目前沒有可排名的權證資料。")
+                    continue
+
+                if "warrant_score" in _wr.columns:
+                    _wr["warrant_score"] = pd.to_numeric(
+                        _wr["warrant_score"], errors="coerce"
+                    ).fillna(0)
+
+                if "eligible" in _wr.columns:
+                    _pass = _wr[_wr["eligible"] == True].copy()
+                    _fail = _wr[_wr["eligible"] != True].copy()
+
+                    if "warrant_score" in _pass.columns:
+                        _pass = _pass.sort_values("warrant_score", ascending=False)
+                    if "warrant_score" in _fail.columns:
+                        _fail = _fail.sort_values("warrant_score", ascending=False)
+
+                    _top5 = pd.concat([_pass, _fail], ignore_index=True).head(5)
+                else:
+                    if "warrant_score" in _wr.columns:
+                        _top5 = _wr.sort_values("warrant_score", ascending=False).head(5)
+                    else:
+                        _top5 = _wr.head(5)
+
+                _top5 = _top5.copy()
+                _top5.insert(0, "同標的排名", range(1, len(_top5)+1))
+
+                _cols = [
+                    "同標的排名","warrant_code","warrant_name","issuer",
+                    "price","volume","strike","expiry","days_to_expiry",
+                    "otm_pct","delta","effective_leverage","spread_pct","iv",
+                    "warrant_score","eligible","filter_reason"
+                ]
+                _show = _top5[[c for c in _cols if c in _top5.columns]]
+
+                st.dataframe(
+                    zh_warrant_table(_show),
+                    width="stretch",
+                    hide_index=True
+                )
+
+                if "eligible" in _top5.columns and (_top5["eligible"] == True).any():
+                    _best = _top5[_top5["eligible"] == True].iloc[0]
+                    _best_score = pd.to_numeric(_best.get("warrant_score"), errors="coerce")
+                    _best_score = float(_best_score) if pd.notna(_best_score) else 0.0
+                    st.success(
+                        f"此標的目前首選：{_best.get('warrant_code','')} "
+                        f"{_best.get('warrant_name','')}｜權證分數 {_best_score:.1f}"
+                    )
+                else:
+                    st.warning(
+                        "這檔股票目前沒有權證通過全部硬條件；表格列出相對較佳者供觀察。"
+                    )
 
 with TAB_SETTINGS:
     st.markdown("""
