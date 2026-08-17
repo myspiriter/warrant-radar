@@ -76,12 +76,37 @@ def load_warrant_volume():
     except Exception:
         return pd.DataFrame()
 
-@st.cache_data(ttl=900, show_spinner=False)
+MARKET_LAST_GOOD = Path("/tmp/warrant_radar_last_good_market.csv")
+
+@st.cache_data(ttl=300, show_spinner=False)
 def load_all_stocks():
+    """V6.4：多來源抓取＋本次雲端執行期間的 last-good 快取。"""
     try:
-        return twse_all_stock_daily()
+        df = twse_all_stock_daily()
+        if df is not None and not df.empty:
+            try:
+                df.to_csv(MARKET_LAST_GOOD, index=False, encoding="utf-8-sig")
+            except Exception:
+                pass
+            return df
     except Exception:
-        return pd.DataFrame()
+        pass
+
+    # 如果官方來源暫時全部失效，使用本次 Streamlit instance 最後一次成功快取。
+    try:
+        if MARKET_LAST_GOOD.exists():
+            cached = pd.read_csv(MARKET_LAST_GOOD, dtype={"code":str})
+            if not cached.empty:
+                cached["data_source"] = "本機 last-good 快取"
+                cached["source_mode"] = "快取備援"
+                return cached
+    except Exception:
+        pass
+
+    return pd.DataFrame(columns=[
+        "code","name","volume","turnover","open","high","low","close",
+        "change","trade_date","volume_lots","data_source","source_mode","fetched_at"
+    ])
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def load_warrant_basic():
@@ -432,7 +457,7 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.3")
+st.title("📡 個人版台股權證雷達 V6.4")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -440,6 +465,18 @@ with st.spinner("掃描全市場與權證流動性…"):
     all_stocks = load_all_stocks()
     wvol = load_warrant_volume()
     wbasic = load_warrant_basic()
+
+# V6.4 市場資料來源狀態
+market_source = "無可用資料"
+market_mode = "異常"
+market_fetched_at = "—"
+if not all_stocks.empty:
+    if "data_source" in all_stocks.columns and all_stocks["data_source"].notna().any():
+        market_source = str(all_stocks["data_source"].dropna().iloc[0])
+    if "source_mode" in all_stocks.columns and all_stocks["source_mode"].notna().any():
+        market_mode = str(all_stocks["source_mode"].dropna().iloc[0])
+    if "fetched_at" in all_stocks.columns and all_stocks["fetched_at"].notna().any():
+        market_fetched_at = str(all_stocks["fetched_at"].dropna().iloc[0])
 
 if not all_stocks.empty:
     for _, r in all_stocks[["code","name"]].dropna().iterrows():
@@ -455,13 +492,19 @@ if not wbasic.empty and not all_stocks.empty:
 
 health_rows, health_ok = data_health(all_stocks, wbasic, wvol)
 with st.expander("🩺 資料健康檢查", expanded=(health_ok < 3)):
-    h1,h2,h3 = st.columns(3)
+    h1,h2,h3,h4 = st.columns(4)
     for col,(label,ok,count) in zip([h1,h2,h3],health_rows):
         col.metric(label, "正常" if ok else "異常/無資料", f"{count:,} 筆")
+    h4.metric("市場資料來源", market_mode, market_source)
     if health_ok < 3:
         st.warning("部分公開資料源目前沒有回傳資料。v6 會降級運作，不會把『資料缺失』直接判定成『市場沒有機會』。")
     else:
         st.success("策略掃描所需的三組公開資料均已取得。")
+    if not all_stocks.empty:
+        if market_mode == "主來源":
+            st.caption(f"市場資料：{market_source}｜抓取時間：{market_fetched_at}")
+        else:
+            st.warning(f"目前使用市場資料備援模式：{market_source}｜抓取時間：{market_fetched_at}。榜單可用，但請注意資料可能較主來源延遲。")
     if not wbasic.empty:
         _total_w = len(wbasic)
         _linked_w = int(wbasic["underlying"].astype(str).str.fullmatch(r"\d{4}", na=False).sum()) if "underlying" in wbasic.columns else 0
@@ -475,6 +518,9 @@ with st.sidebar:
     live_top_n = st.slider("盤中更新前幾名候選", 3, 20, 10, step=1)
     if st.button("🔄 立即刷新盤中行情", use_container_width=True):
         load_live_quotes.clear()
+        st.rerun()
+    if st.button("♻️ 重新抓取全市場資料", use_container_width=True):
+        load_all_stocks.clear()
         st.rerun()
     st.caption("盤中行情約每20秒可重新抓取；策略分數仍以較完整的日線資料計算，避免只看瞬間波動。")
     st.divider()
@@ -590,11 +636,17 @@ if (warrants is None or warrants.empty or
 
 # 資料新鮮度提示
 if not all_stocks.empty:
-    td = all_stocks["trade_date"].dropna().astype(str)
+    td = all_stocks["trade_date"].dropna().astype(str) if "trade_date" in all_stocks.columns else pd.Series(dtype=str)
     trade_text = td.iloc[0] if len(td) else "最近交易日"
-    st.caption(f"📅 市場資料：{trade_text}｜本版為公開資料掃描，並非券商逐筆即時報價。")
+    st.caption(
+        f"📅 市場資料：{trade_text}｜來源：{market_source}（{market_mode}）｜"
+        f"本版為公開資料掃描，並非券商逐筆即時報價。"
+    )
 else:
-    st.warning("目前無法取得 TWSE 全市場資料，請稍後重新整理；固定關注功能仍可使用。")
+    st.error(
+        "目前三組 TWSE 全市場資料來源皆無法取得，而且尚無 last-good 快取。"
+        "這是『資料源異常』，不是市場沒有投資標的；固定關注股仍可使用。"
+    )
 
 # 統一資料表欄位防呆：無論資料源是否暫時回傳空值，後面都不會因缺欄位而中斷
 required_ranking_cols = {

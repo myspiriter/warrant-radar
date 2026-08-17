@@ -1,10 +1,12 @@
 from __future__ import annotations
 from datetime import date
 from typing import Optional
+from pathlib import Path
 import time
 import re
 import pandas as pd
 import requests
+from io import StringIO
 
 HEADERS = {"User-Agent": "Mozilla/5.0 WarrantRadar/2.0"}
 
@@ -56,15 +58,17 @@ def twse_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
         return pd.DataFrame()
     return pd.concat(frames,ignore_index=True).drop_duplicates("date").sort_values("date")
 
-def twse_all_stock_daily() -> pd.DataFrame:
-    """TWSE 上市個股當日/最近交易日成交資訊。用於全市場第一層快速掃描。"""
-    js = _get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
-    df = pd.DataFrame(js)
+
+def _standardize_stock_daily(df: pd.DataFrame, source_name: str, trade_date_hint: str = "") -> pd.DataFrame:
+    """把不同 TWSE 來源統一成雷達需要的欄位。"""
+    if df is None or df.empty:
+        return pd.DataFrame()
+
     aliases = {
-        "code":["Code","證券代號","股票代號"],
+        "code":["Code","證券代號","股票代號","證券代碼"],
         "name":["Name","證券名稱","股票名稱"],
         "volume":["TradeVolume","成交股數","成交量"],
-        "turnover":["TradeValue","成交金額"],
+        "turnover":["TradeValue","成交金額","成交值"],
         "open":["OpeningPrice","開盤價"],
         "high":["HighestPrice","最高價"],
         "low":["LowestPrice","最低價"],
@@ -72,24 +76,159 @@ def twse_all_stock_daily() -> pd.DataFrame:
         "change":["Change","漲跌價差"],
         "trade_date":["Date","交易日期","日期"],
     }
-    ren={}
-    for target,cands in aliases.items():
+
+    ren = {}
+    for target, cands in aliases.items():
         for c in cands:
             if c in df.columns:
-                ren[c]=target; break
-    df=df.rename(columns=ren)
+                ren[c] = target
+                break
+
+    x = df.rename(columns=ren).copy()
     for c in aliases:
-        if c not in df.columns: df[c]=pd.NA
-    df["code"]=df["code"].astype(str).str.strip()
-    df["name"]=df["name"].astype(str).str.strip()
+        if c not in x.columns:
+            x[c] = pd.NA
+
+    x["code"] = x["code"].fillna("").astype(str).str.strip()
+    x["name"] = x["name"].fillna("").astype(str).str.strip()
+
     for c in ["volume","turnover","open","high","low","close","change"]:
-        df[c]=_num(df[c])
-    # API volume is normally shares; normalize to lots when magnitude indicates shares.
-    if df["volume"].dropna().median() > 10000:
-        df["volume_lots"]=df["volume"]/1000.0
+        x[c] = _num(x[c])
+
+    valid_code = x["code"].str.fullmatch(r"\d{4}", na=False)
+    x = x[valid_code].copy()
+
+    if x.empty:
+        return pd.DataFrame()
+
+    # TWSE 公開資料通常以股數呈現；轉成張。
+    med = x["volume"].dropna().median() if x["volume"].notna().any() else 0
+    if med > 10000:
+        x["volume_lots"] = x["volume"] / 1000.0
     else:
-        df["volume_lots"]=df["volume"]
-    return df
+        x["volume_lots"] = x["volume"]
+
+    if trade_date_hint:
+        x["trade_date"] = x["trade_date"].fillna("").astype(str)
+        x.loc[x["trade_date"].str.strip().eq(""), "trade_date"] = trade_date_hint
+
+    x["data_source"] = source_name
+    x["source_mode"] = "主來源" if "OpenAPI" in source_name else "備援來源"
+    x["fetched_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    # 最低健康門檻；避免 API 回錯頁/空結構卻被當成正常。
+    if len(x) < 100:
+        return pd.DataFrame()
+
+    return x.reset_index(drop=True)
+
+
+def _twse_market_openapi() -> pd.DataFrame:
+    js = _get_json("https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL")
+    return _standardize_stock_daily(pd.DataFrame(js), "TWSE OpenAPI / STOCK_DAY_ALL")
+
+
+def _twse_market_open_data_csv() -> pd.DataFrame:
+    """官方舊式 open_data CSV，作為 OpenAPI 失敗時第一備援。"""
+    url = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
+    r = requests.get(
+        url,
+        params={"response":"open_data"},
+        timeout=20,
+        headers=HEADERS,
+    )
+    r.raise_for_status()
+    text = r.text
+    if not text or len(text) < 100:
+        return pd.DataFrame()
+
+    # TWSE CSV 通常 UTF-8；若前面有 BOM，pandas 也可處理。
+    df = pd.read_csv(StringIO(text))
+    return _standardize_stock_daily(df, "TWSE open_data CSV / STOCK_DAY_ALL")
+
+
+def _parse_mi_index_json(js: dict, trade_date_hint: str) -> pd.DataFrame:
+    """MI_INDEX JSON 的 table 編號可能變動，因此動態尋找含『證券代號』的 fields/data pair。"""
+    if not isinstance(js, dict):
+        return pd.DataFrame()
+
+    candidates = []
+    for k, fields in js.items():
+        if not str(k).startswith("fields") or not isinstance(fields, list):
+            continue
+        field_text = "|".join(map(str, fields))
+        if "證券代號" not in field_text:
+            continue
+
+        suffix = str(k)[6:]  # fields9 -> 9
+        data_key = f"data{suffix}"
+        rows = js.get(data_key)
+        if isinstance(rows, list) and rows:
+            candidates.append((fields, rows))
+
+    for fields, rows in candidates:
+        try:
+            df = pd.DataFrame(rows, columns=fields)
+            out = _standardize_stock_daily(
+                df,
+                "TWSE MI_INDEX JSON",
+                trade_date_hint=trade_date_hint,
+            )
+            if not out.empty:
+                return out
+        except Exception:
+            continue
+    return pd.DataFrame()
+
+
+def _twse_market_mi_index(max_lookback_days: int = 10) -> pd.DataFrame:
+    """第二備援：每日收盤行情 MI_INDEX，自動往前找最近有交易資料的一天。"""
+    today = pd.Timestamp.today().normalize()
+    for i in range(max_lookback_days + 1):
+        d = today - pd.Timedelta(days=i)
+        ds = d.strftime("%Y%m%d")
+        try:
+            js = _get_json(
+                "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+                {"date": ds, "type": "ALLBUT0999", "response": "json"},
+                timeout=20,
+            )
+            out = _parse_mi_index_json(js, ds)
+            if not out.empty:
+                return out
+        except Exception:
+            pass
+    return pd.DataFrame()
+
+
+def twse_all_stock_daily() -> pd.DataFrame:
+    """V6.4 全市場資料多重容錯：
+    1. TWSE OpenAPI
+    2. TWSE open_data CSV
+    3. TWSE MI_INDEX 最近交易日 JSON
+    """
+    loaders = [
+        _twse_market_openapi,
+        _twse_market_open_data_csv,
+        _twse_market_mi_index,
+    ]
+    errors = []
+    for fn in loaders:
+        try:
+            out = fn()
+            if out is not None and not out.empty:
+                return out
+            errors.append(f"{fn.__name__}: 空資料")
+        except Exception as e:
+            errors.append(f"{fn.__name__}: {type(e).__name__}")
+
+    # 最後回傳有標準欄位的空表，讓 App 顯示「資料源異常」而非誤判 0 檔。
+    empty = pd.DataFrame(columns=[
+        "code","name","volume","turnover","open","high","low","close",
+        "change","trade_date","volume_lots","data_source","source_mode","fetched_at"
+    ])
+    empty.attrs["source_errors"] = errors
+    return empty
 
 def twse_warrant_basic() -> pd.DataFrame:
     """TWSE 上市權證基本資料。
