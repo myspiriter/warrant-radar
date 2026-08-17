@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes
+from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 
 APP_DIR = Path(__file__).resolve().parent
@@ -325,7 +325,7 @@ def candidate_grade(score):
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 v6.1｜永不空榜實戰版")
+st.title("📡 個人版台股權證雷達 v6.2｜權證關聯修正版")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -338,6 +338,13 @@ if not all_stocks.empty:
     for _, r in all_stocks[["code","name"]].dropna().iterrows():
         DYNAMIC_NAMES[str(r["code"])] = str(r["name"])
 
+# V6.2：官方標的代號缺失時，由權證名稱前綴反推標的股票
+if not wbasic.empty and not all_stocks.empty:
+    try:
+        wbasic = infer_underlying_from_warrant_name(wbasic, all_stocks)
+    except Exception as _e:
+        st.warning(f"權證名稱備援關聯暫時失敗：{_e}")
+
 
 health_rows, health_ok = data_health(all_stocks, wbasic, wvol)
 with st.expander("🩺 資料健康檢查", expanded=(health_ok < 3)):
@@ -348,6 +355,12 @@ with st.expander("🩺 資料健康檢查", expanded=(health_ok < 3)):
         st.warning("部分公開資料源目前沒有回傳資料。v6 會降級運作，不會把『資料缺失』直接判定成『市場沒有機會』。")
     else:
         st.success("策略掃描所需的三組公開資料均已取得。")
+    if not wbasic.empty:
+        _total_w = len(wbasic)
+        _linked_w = int(wbasic["underlying"].astype(str).str.fullmatch(r"\d{4}", na=False).sum()) if "underlying" in wbasic.columns else 0
+        _call_w = int((wbasic["warrant_type"]=="CALL").sum()) if "warrant_type" in wbasic.columns else 0
+        st.caption(f"V6.2 權證關聯診斷：基本資料 {_total_w:,} 筆｜可辨識股票標的 {_linked_w:,} 筆｜認購權證 {_call_w:,} 筆")
+
 
 with st.sidebar:
     st.header("V6 盤中模式")
@@ -409,7 +422,7 @@ if scan_mode:
         pool = fallback_market_candidates(all_stocks, fallback_count)
         st.warning(
             "正式『有足夠活躍權證』預篩目前為 0 檔。"
-            "V6.1 已自動啟動保底候選池，因此下方仍會列出全市場高流動性股票進行評分。"
+            "V6.2 已自動啟動保底候選池，因此下方仍會列出全市場高流動性股票進行評分。"
             "保底候選不等於權證可直接買進，仍需到『權證排行』確認。"
         )
 
@@ -445,6 +458,26 @@ if uploaded is not None:
     warrants=merge_warrant_volume(wterms,wvol)
 else:
     warrants=merge_warrant_volume(wbasic,wvol) if not wbasic.empty else pd.DataFrame()
+    if not warrants.empty and not all_stocks.empty:
+        warrants=infer_underlying_from_warrant_name(warrants, all_stocks)
+
+# 若基本資料仍完全無法對應標的，但每日成交資料有名稱，建立最低限度備援關聯
+if (warrants is None or warrants.empty or
+    ("underlying" in warrants.columns and
+     warrants["underlying"].astype(str).str.fullmatch(r"\d{4}", na=False).sum() == 0)):
+    if not wvol.empty and "warrant_name" in wvol.columns:
+        _synthetic = wvol.copy()
+        if "warrant_code" not in _synthetic.columns:
+            _synthetic["warrant_code"] = ""
+        _synthetic["issuer"] = ""
+        _synthetic["warrant_type"] = _synthetic["warrant_name"].fillna("").astype(str).map(
+            lambda n: "PUT" if "售" in n else "CALL"
+        )
+        for _c in ["strike","expiry","ratio","underlying","underlying_name"]:
+            if _c not in _synthetic.columns:
+                _synthetic[_c] = pd.NA
+        _synthetic = infer_underlying_from_warrant_name(_synthetic, all_stocks)
+        warrants = _synthetic
 
 # 資料新鮮度提示
 if not all_stocks.empty:
