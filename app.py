@@ -214,6 +214,8 @@ with st.sidebar:
 
 if scan_mode:
     pool=build_dynamic_pool(all_stocks,wbasic,wvol,min_stock_volume,min_turnover_m,min_liquid_warrants,max_candidates)
+    if pool.empty:
+        st.warning("今日全市場預篩沒有符合目前門檻的股票，系統已保留固定關注股功能。你也可以在左側降低『最低成交量／成交金額／活躍權證數』門檻。")
     with st.spinner(f"深度評分 {len(pool)} 檔候選股…"):
         ranking=dynamic_ranking(pool)
 else:
@@ -249,7 +251,7 @@ else:
 
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
-valid = ranking[ranking.score > 0]
+valid = ranking[ranking["score"] > 0]
 c1.metric("今日候選", len(ranking))
 c2.metric("80分以上", int((valid.score >= 80).sum()))
 c3.metric("事件型反彈", int((valid.setup == "事件型反彈").sum()))
@@ -260,7 +262,11 @@ TAB_TODAY, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
 
 with TAB_TODAY:
     st.subheader("今日推薦")
-    recommended = ranking[(ranking["score"] >= 75) & (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足"]))].copy()
+    if "score" not in ranking.columns:
+        ranking["score"] = 0
+    if "setup" not in ranking.columns:
+        ranking["setup"] = "資料不足"
+    recommended = ranking[(pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 75) & (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足"]))].copy()
     if recommended.empty:
         st.info("今天沒有達到推薦門檻的標的，不為了湊滿名額而降低標準。")
         recommended = ranking.head(10)
@@ -270,7 +276,7 @@ with TAB_TODAY:
     st.dataframe(show_df, width="stretch", hide_index=True,
                  column_config={"機會分數":st.column_config.ProgressColumn("機會分數", min_value=0,max_value=100,format="%.1f")})
 
-    top_codes = recommended[recommended.score > 0].code.tolist()
+    top_codes = recommended[pd.to_numeric(recommended["score"], errors="coerce").fillna(0) > 0]["code"].astype(str).tolist() if ("score" in recommended.columns and "code" in recommended.columns) else []
     if top_codes:
         chosen = st.selectbox("查看個股", top_codes, format_func=stock_label, key="today_stock")
         sr = ranking[ranking.code == chosen].iloc[0].to_dict()

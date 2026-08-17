@@ -1,4 +1,4 @@
-# 個人版台股權證雷達 v5｜全市場動態掃描版
+# 個人版台股權證雷達 v5.1｜全市場動態掃描修正版
 
 ## v5 核心升級
 - 每日自動掃描 TWSE 上市股票，不再只分析固定追蹤清單。
@@ -19,3 +19,9 @@ TWSE 公開資料適合每日/盤後掃描，但不是券商逐筆即時行情�
 ## Streamlit Cloud 更新
 把本資料夾內檔案上傳覆蓋 GitHub `warrant-radar` repository 的同名檔案。
 Streamlit Cloud 會偵測 GitHub commit 並自動重新部署。
+
+
+## v5.1 修正
+- 修正全市場掃描結果為空時 `ranking.score` 造成的 AttributeError。
+- 補上空資料與缺欄位防呆，不再因 TWSE 回傳異常而整個 App 中斷。
+- 無候選股時會顯示中文提示，固定關注股仍可使用。
