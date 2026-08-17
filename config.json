@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.1",
+  "version": "6.1-corrected",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,

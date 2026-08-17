@@ -41,7 +41,7 @@ def zh_stock_table(df: pd.DataFrame) -> pd.DataFrame:
         "change_pct_live":"盤中漲跌幅(%)", "volume_live":"盤中累計量",
         "quote_time":"行情時間"
     })
-    cols=[c for c in ["股票","機會分數","盤中判斷","訊號類型","盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間","前收/日線收盤價","日線漲跌幅(%)","近5日漲跌幅(%)","日線量比","RSI強弱指標","20日均線"] if c in x.columns]
+    cols=[c for c in ["股票","機會分數","候選等級","盤中判斷","訊號類型","盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間","前收/日線收盤價","日線漲跌幅(%)","近5日漲跌幅(%)","日線量比","RSI強弱指標","20日均線"] if c in x.columns]
     return x[cols]
 
 def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -229,8 +229,103 @@ def dynamic_ranking(pool: pd.DataFrame):
     return out.sort_values("score",ascending=False).reset_index(drop=True)
 
 
+
+def fallback_market_candidates(all_stocks: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
+    """正式權證預篩為空時的保底候選池。
+    以成交金額 70% + 成交量 30% 排序，確保畫面不會因權證資料關聯失敗而整頁空白。
+    """
+    required = ["code","name","close","volume_lots","turnover"]
+    if all_stocks is None or all_stocks.empty:
+        return pd.DataFrame(columns=required)
+
+    x = all_stocks.copy()
+    for c in required:
+        if c not in x.columns:
+            x[c] = pd.NA
+
+    x["code"] = x["code"].astype(str).str.strip()
+    x = x[x["code"].str.fullmatch(r"\d{4}", na=False)]
+    x["close"] = pd.to_numeric(x["close"], errors="coerce")
+    x["volume_lots"] = pd.to_numeric(x["volume_lots"], errors="coerce").fillna(0)
+    x["turnover"] = pd.to_numeric(x["turnover"], errors="coerce").fillna(0)
+    x = x[(x["close"] > 0) & (x["volume_lots"] > 0)]
+
+    if x.empty:
+        return pd.DataFrame(columns=required)
+
+    x["_成交金額排名"] = x["turnover"].rank(pct=True)
+    x["_成交量排名"] = x["volume_lots"].rank(pct=True)
+    x["預篩分數"] = x["_成交金額排名"] * 70 + x["_成交量排名"] * 30
+    return x.sort_values("預篩分數", ascending=False).head(max_rows).reset_index(drop=True)
+
+
+def screening_funnel(all_stocks, wb, wv, min_stock_volume, min_turnover_m, min_liquid_warrants, min_warrant_volume):
+    """顯示每一關剩幾檔，避免只看到 0 卻不知道卡在哪。"""
+    rows = []
+    if all_stocks is None or all_stocks.empty:
+        return pd.DataFrame([{"篩選階段":"全市場股票","剩餘檔數":0}])
+
+    s = all_stocks.copy()
+    s["code"] = s["code"].astype(str).str.strip()
+    s = s[s["code"].str.fullmatch(r"\d{4}", na=False)]
+    rows.append({"篩選階段":"全市場四位數上市股票","剩餘檔數":len(s)})
+
+    s["volume_lots"] = pd.to_numeric(s["volume_lots"], errors="coerce").fillna(0)
+    s["turnover"] = pd.to_numeric(s["turnover"], errors="coerce").fillna(0)
+
+    s = s[s["volume_lots"] >= min_stock_volume]
+    rows.append({"篩選階段":f"現股成交量 ≥ {min_stock_volume:,} 張","剩餘檔數":len(s)})
+
+    s = s[s["turnover"] >= min_turnover_m * 1_000_000]
+    rows.append({"篩選階段":f"現股成交金額 ≥ {min_turnover_m:,} 百萬元","剩餘檔數":len(s)})
+
+    if wb is None or wb.empty:
+        rows.append({"篩選階段":"具有權證基本資料","剩餘檔數":0})
+        return pd.DataFrame(rows)
+
+    w = wb.copy()
+    if "underlying" not in w.columns:
+        rows.append({"篩選階段":"權證標的代號可辨識","剩餘檔數":0})
+        return pd.DataFrame(rows)
+
+    if "warrant_type" in w.columns:
+        w = w[w["warrant_type"].eq("CALL")]
+
+    # 先看有認購權證的標的
+    under = set(w["underlying"].dropna().astype(str).str.strip())
+    s_has = s[s["code"].isin(under)]
+    rows.append({"篩選階段":"具有認購權證","剩餘檔數":len(s_has)})
+
+    if wv is None or wv.empty or "volume" not in wv.columns:
+        rows.append({"篩選階段":"有當日權證成交資料","剩餘檔數":0})
+        return pd.DataFrame(rows)
+
+    vv = wv[["warrant_code","volume"]].copy()
+    vv["volume"] = pd.to_numeric(vv["volume"], errors="coerce").fillna(0)
+    w = w.merge(vv.drop_duplicates("warrant_code", keep="last"), on="warrant_code", how="left")
+    liquid = w[w["volume"].fillna(0) >= min_warrant_volume]
+    counts = liquid.groupby("underlying")["warrant_code"].nunique()
+    valid_under = set(counts[counts >= min_liquid_warrants].index.astype(str))
+    s_final = s_has[s_has["code"].isin(valid_under)]
+    rows.append({"篩選階段":f"至少 {min_liquid_warrants} 張活躍認購權證","剩餘檔數":len(s_final)})
+    return pd.DataFrame(rows)
+
+
+def candidate_grade(score):
+    score = pd.to_numeric(pd.Series([score]), errors="coerce").fillna(0).iloc[0]
+    if score >= 80:
+        return "🔥 強力候選"
+    if score >= 70:
+        return "🟢 今日推薦"
+    if score >= 60:
+        return "🟡 NEXT 潛在"
+    if score >= 50:
+        return "⚪ 持續觀察"
+    return "低優先"
+
+
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 v6｜盤中實戰版")
+st.title("📡 個人版台股權證雷達 v6.1｜永不空榜實戰版")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -269,6 +364,8 @@ with st.sidebar:
     min_turnover_m = st.number_input("現股最低成交金額（百萬元）", 0, 100000, 50, step=10)
     min_liquid_warrants = st.number_input("至少活躍認購權證數", 1, 50, 3, step=1)
     max_candidates = st.slider("進入深度評分候選數", 20, 100, 60, step=10)
+    fallback_count = st.slider("正式預篩為0時，保底候選數", 10, 50, 30, step=5)
+    show_funnel = st.toggle("顯示篩選漏斗診斷", value=True)
     st.caption("先用流動性與權證活躍度快速預篩，再對候選股計算技術/量價分數，避免全市場逐檔抓歷史造成過慢。")
 
     st.divider()
@@ -294,14 +391,41 @@ with st.sidebar:
     st.caption("官方資料可做每日掃描；若要 Delta、IV、即時買賣價差，仍建議補充券商資料或未來串接即時行情。")
 
 if scan_mode:
-    pool=build_dynamic_pool(all_stocks,wbasic,wvol,min_stock_volume,min_turnover_m,min_liquid_warrants,max_candidates)
+    funnel_df = screening_funnel(
+        all_stocks, wbasic, wvol,
+        min_stock_volume, min_turnover_m, min_liquid_warrants,
+        cfg["min_warrant_volume"]
+    )
+
+    pool = build_dynamic_pool(
+        all_stocks, wbasic, wvol,
+        min_stock_volume, min_turnover_m,
+        min_liquid_warrants, max_candidates
+    )
+
+    fallback_used = False
     if pool.empty:
-        st.warning("今日全市場預篩沒有符合目前門檻的股票，系統已保留固定關注股功能。你也可以在左側降低『最低成交量／成交金額／活躍權證數』門檻。")
+        fallback_used = True
+        pool = fallback_market_candidates(all_stocks, fallback_count)
+        st.warning(
+            "正式『有足夠活躍權證』預篩目前為 0 檔。"
+            "V6.1 已自動啟動保底候選池，因此下方仍會列出全市場高流動性股票進行評分。"
+            "保底候選不等於權證可直接買進，仍需到『權證排行』確認。"
+        )
+
     with st.spinner(f"深度評分 {len(pool)} 檔候選股…"):
-        ranking=dynamic_ranking(pool)
+        ranking = dynamic_ranking(pool)
+
+    if show_funnel:
+        with st.expander("🔍 為什麼正式預篩會是 0？｜篩選漏斗", expanded=fallback_used):
+            st.dataframe(funnel_df, width="stretch", hide_index=True)
+            if not funnel_df.empty:
+                st.caption("最後一關若突然歸零，通常代表權證標的代號/成交量資料關聯或門檻造成，而不是全市場真的沒有股票。")
 else:
+    fallback_used = False
+    funnel_df = pd.DataFrame()
     with st.spinner("更新固定關注股…"):
-        ranking=stock_ranking(watchlist)
+        ranking = stock_ranking(watchlist)
 
 # 固定關注股另外計算，不受每日 TOP 排名限制
 with st.spinner("更新我的關注股…"):
@@ -349,6 +473,7 @@ for _col, _default in required_ranking_cols.items():
         ranking[_col] = _default
 ranking["score"] = pd.to_numeric(ranking["score"], errors="coerce").fillna(0)
 ranking["setup"] = ranking["setup"].fillna("資料不足").astype(str)
+ranking["候選等級"] = ranking["score"].map(candidate_grade)
 
 # V6 盤中行情覆蓋：只更新候選前 N 名，避免一次抓全市場造成延遲
 live_quotes = pd.DataFrame()
@@ -378,7 +503,7 @@ ranking["盤中判斷"] = ranking.apply(
 c1,c2,c3,c4 = st.columns(4)
 valid = ranking[pd.to_numeric(ranking["score"], errors="coerce").fillna(0) > 0].copy()
 c1.metric("今日候選", len(ranking))
-c2.metric("80分以上", int((pd.to_numeric(valid["score"], errors="coerce").fillna(0) >= 80).sum()))
+c2.metric("80分以上強力候選", int((pd.to_numeric(valid["score"], errors="coerce").fillna(0) >= 80).sum()))
 c3.metric("事件型反彈", int((valid["setup"] == "事件型反彈").sum()))
 c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破型"]).sum()))
 
@@ -387,12 +512,20 @@ TAB_TODAY, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
 
 with TAB_TODAY:
     st.subheader("今日推薦")
-    recommended = ranking[(pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 75) & (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足"]))].copy()
+    recommended = ranking[
+        (pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 70) &
+        (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足"]))
+    ].copy()
+
     if recommended.empty:
-        st.info("今天沒有達到推薦門檻的標的，不為了湊滿名額而降低標準。")
-        recommended = ranking.head(10)
+        if ranking.empty:
+            st.error("連保底候選池也無法建立。這代表股票市場日資料本身異常，不是『沒有投資標的』。")
+            recommended = ranking.copy()
+        else:
+            st.info("今天沒有 ≥70 分的正式推薦；以下改顯示目前全市場最高分 TOP 10，供觀察而非直接買進。")
+            recommended = ranking.head(10).copy()
     else:
-        recommended = recommended.head(10)
+        recommended = recommended.head(10).copy()
     show_df = zh_stock_table(recommended)
     st.dataframe(show_df, width="stretch", hide_index=True,
                  column_config={"機會分數":st.column_config.ProgressColumn("機會分數", min_value=0,max_value=100,format="%.1f")})
@@ -461,7 +594,7 @@ with TAB_NEXT:
         st.info("目前沒有資料。")
     else:
         nxt = ranking[
-            (ranking["score"] >= 62) & (ranking["score"] < 80) &
+            (ranking["score"] >= 55) & (ranking["score"] < 70) &
             (ranking["setup"].isin(["蓄勢/中性","趨勢回檔","突破型"]))
         ].copy().head(10)
         if nxt.empty:
