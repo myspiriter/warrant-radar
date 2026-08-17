@@ -1,4 +1,4 @@
-# 個人版台股權證雷達 v5.1｜全市場動態掃描修正版
+# 個人版台股權證雷達 v5.2｜全市場動態掃描穩定版
 
 ## v5 核心升級
 - 每日自動掃描 TWSE 上市股票，不再只分析固定追蹤清單。
@@ -25,3 +25,9 @@ Streamlit Cloud 會偵測 GitHub commit 並自動重新部署。
 - 修正全市場掃描結果為空時 `ranking.score` 造成的 AttributeError。
 - 補上空資料與缺欄位防呆，不再因 TWSE 回傳異常而整個 App 中斷。
 - 無候選股時會顯示中文提示，固定關注股仍可使用。
+
+## v5.2 修正
+- 修正 Header metrics 在空資料時仍先讀取 `ranking["score"]` 的 KeyError。
+- `stock_ranking()` 與 `dynamic_ranking()` 現在即使沒有任何資料，也會回傳具完整欄位的空表。
+- 所有首頁統計之前新增統一欄位標準化 gate。
+- 休市、資料源空值或當日沒有候選標的時，App 應顯示提示而不是整頁中斷。

@@ -112,15 +112,27 @@ def issuer_from_name(name: str):
 
 
 def stock_ranking(watchlist):
+    base_cols = ["code","score","setup","close","ret1_pct","ret5_pct","volume_ratio","rsi14","ma20"]
     rows = []
     for code in watchlist:
         try:
             h = load_hist(code)
             s = stock_score(h)
-            rows.append({"code":str(code), **s})
+            row = {"code":str(code)}
+            if isinstance(s, dict):
+                row.update(s)
+            rows.append(row)
         except Exception as e:
             rows.append({"code":str(code), "score":0, "setup":"資料錯誤", "error":str(e)})
-    return pd.DataFrame(rows).sort_values("score", ascending=False).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=base_cols)
+    out = pd.DataFrame(rows)
+    for c in base_cols:
+        if c not in out.columns:
+            out[c] = pd.NA
+    out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0)
+    out["setup"] = out["setup"].fillna("資料不足")
+    return out.sort_values("score", ascending=False).reset_index(drop=True)
 
 
 
@@ -153,22 +165,40 @@ def build_dynamic_pool(all_stocks: pd.DataFrame, wb: pd.DataFrame, wv: pd.DataFr
     return s.sort_values("預篩分數",ascending=False).head(max_candidates).reset_index(drop=True)
 
 def dynamic_ranking(pool: pd.DataFrame):
+    base_cols = [
+        "code","name","活躍權證數","現股成交量(張)","現股成交金額",
+        "score","setup","close","ret1_pct","ret5_pct","volume_ratio","rsi14","ma20"
+    ]
+    if pool is None or pool.empty:
+        return pd.DataFrame(columns=base_cols)
     rows=[]
     for _,r in pool.iterrows():
-        code=str(r["code"])
+        code=str(r.get("code","")).strip()
+        if not code:
+            continue
         try:
             h=load_hist(code)
             s=stock_score(h)
-            rows.append({"code":code,"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
-                         "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0),**s})
+            row={"code":code,"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
+                 "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0)}
+            if isinstance(s, dict):
+                row.update(s)
+            rows.append(row)
         except Exception as e:
             rows.append({"code":code,"name":r.get("name",""),"score":0,"setup":"資料錯誤","error":str(e)})
-    if not rows: return pd.DataFrame()
-    return pd.DataFrame(rows).sort_values("score",ascending=False).reset_index(drop=True)
+    if not rows:
+        return pd.DataFrame(columns=base_cols)
+    out=pd.DataFrame(rows)
+    for c in base_cols:
+        if c not in out.columns:
+            out[c]=pd.NA
+    out["score"]=pd.to_numeric(out["score"],errors="coerce").fillna(0)
+    out["setup"]=out["setup"].fillna("資料不足")
+    return out.sort_values("score",ascending=False).reset_index(drop=True)
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 v5")
+st.title("📡 個人版台股權證雷達 v5.2")
 st.caption("全市場動態掃描 → 今日推薦 → 潛在標的 → 每檔最佳權證。資料來自 TWSE 公開資料；非即時逐筆行情，不構成投資建議。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -249,23 +279,39 @@ if not all_stocks.empty:
 else:
     st.warning("目前無法取得 TWSE 全市場資料，請稍後重新整理；固定關注功能仍可使用。")
 
+# 統一資料表欄位防呆：無論資料源是否暫時回傳空值，後面都不會因缺欄位而中斷
+required_ranking_cols = {
+    "code": "",
+    "score": 0.0,
+    "setup": "資料不足",
+    "close": pd.NA,
+    "ret1_pct": pd.NA,
+    "ret5_pct": pd.NA,
+    "volume_ratio": pd.NA,
+    "rsi14": pd.NA,
+    "ma20": pd.NA,
+}
+if ranking is None or not isinstance(ranking, pd.DataFrame):
+    ranking = pd.DataFrame(columns=list(required_ranking_cols.keys()))
+for _col, _default in required_ranking_cols.items():
+    if _col not in ranking.columns:
+        ranking[_col] = _default
+ranking["score"] = pd.to_numeric(ranking["score"], errors="coerce").fillna(0)
+ranking["setup"] = ranking["setup"].fillna("資料不足").astype(str)
+
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
-valid = ranking[ranking["score"] > 0]
+valid = ranking[pd.to_numeric(ranking["score"], errors="coerce").fillna(0) > 0].copy()
 c1.metric("今日候選", len(ranking))
-c2.metric("80分以上", int((valid.score >= 80).sum()))
-c3.metric("事件型反彈", int((valid.setup == "事件型反彈").sum()))
-c4.metric("趨勢回檔/突破", int(valid.setup.isin(["趨勢回檔","突破型"]).sum()))
+c2.metric("80分以上", int((pd.to_numeric(valid["score"], errors="coerce").fillna(0) >= 80).sum()))
+c3.metric("事件型反彈", int((valid["setup"] == "事件型反彈").sum()))
+c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破型"]).sum()))
 
 TAB_TODAY, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
     ["🔥 今日推薦","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
 
 with TAB_TODAY:
     st.subheader("今日推薦")
-    if "score" not in ranking.columns:
-        ranking["score"] = 0
-    if "setup" not in ranking.columns:
-        ranking["setup"] = "資料不足"
     recommended = ranking[(pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 75) & (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足"]))].copy()
     if recommended.empty:
         st.info("今天沒有達到推薦門檻的標的，不為了湊滿名額而降低標準。")
