@@ -40,5 +40,6 @@
   "warrant_link_name_fallback": true,
   "warrant_daily_name_fallback": true,
   "diagnosis_enabled": true,
-  "diagnosis_default_code": ""
+  "diagnosis_default_code": "",
+  "diagnosis_widget_key": "diagnose_code_v2"
 }
