@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.6",
+  "version": "6.7",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -54,5 +54,13 @@
   "warrant_top_n_per_stock": 5,
   "warrant_fuzzy_schema": true,
   "warrant_mis_live_enrichment": true,
-  "missing_display": "explicit"
+  "missing_display": "explicit",
+  "next_live_quote_full": true,
+  "warrant_precise_merge": true,
+  "warrant_price_fallback": [
+    "last",
+    "bid_ask_mid",
+    "daily_price"
+  ],
+  "rank_unknown_fields_soft_fail": true
 }

@@ -472,7 +472,7 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.6")
+st.title("📡 個人版台股權證雷達 V6.7")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -684,77 +684,60 @@ ranking["score"] = pd.to_numeric(ranking["score"], errors="coerce").fillna(0)
 ranking["setup"] = ranking["setup"].fillna("資料不足").astype(str)
 ranking["候選等級"] = ranking["score"].map(candidate_grade)
 
-# V6 盤中行情覆蓋：只更新候選前 N 名，避免一次抓全市場造成延遲
+# V6.7 盤中行情覆蓋
+# 不再只抓 ranking 前 N 名；改成：
+# 1) ranking 前 N 名
+# 2) NEXT 頁可能出現的前 10 名
+# 3) 固定關注股
 live_quotes = pd.DataFrame()
+
+for _c in ["last","bid","ask","volume_live","change_pct_live","quote_date","quote_time"]:
+    if _c not in ranking.columns:
+        ranking[_c] = pd.NA
+
 if intraday_mode and not ranking.empty:
-    live_codes = tuple(ranking.head(live_top_n)["code"].astype(str).tolist())
-    live_quotes = load_live_quotes(live_codes)
-    if not live_quotes.empty:
-        ranking = ranking.merge(
-            live_quotes[["code","last","bid","ask","volume_live","change_pct_live","quote_date","quote_time"]],
-            on="code", how="left"
-        )
-    else:
-        for _c in ["last","bid","ask","volume_live","change_pct_live","quote_date","quote_time"]:
-            if _c not in ranking.columns:
-                ranking[_c] = pd.NA
-else:
-    for _c in ["last","bid","ask","volume_live","change_pct_live","quote_date","quote_time"]:
-        if _c not in ranking.columns:
-            ranking[_c] = pd.NA
+    _codes = []
+
+    # 全市場前 N
+    _codes += ranking.head(live_top_n)["code"].astype(str).tolist()
+
+    # NEXT 可能顯示的前 10 名：55~69 分＋指定 setup
+    _next_for_quote = ranking[
+        (ranking["score"] >= 55) & (ranking["score"] < 70) &
+        (ranking["setup"].isin(["蓄勢/中性","趨勢回檔","突破型"]))
+    ].head(10)
+    _codes += _next_for_quote["code"].astype(str).tolist()
+
+    # 固定關注股
+    _codes += [str(c) for c in watchlist]
+
+    # 去重
+    _codes = list(dict.fromkeys([c for c in _codes if re.fullmatch(r"\d{4}", str(c))]))
+
+    if _codes:
+        live_quotes = load_live_quotes(tuple(_codes))
+        if not live_quotes.empty:
+            _live_cols = [
+                "code","last","bid","ask","volume_live",
+                "change_pct_live","quote_date","quote_time"
+            ]
+            _live_cols = [c for c in _live_cols if c in live_quotes.columns]
+            ranking = ranking.drop(
+                columns=[c for c in _live_cols if c != "code" and c in ranking.columns],
+                errors="ignore"
+            ).merge(
+                live_quotes[_live_cols].drop_duplicates("code", keep="last"),
+                on="code", how="left"
+            )
 
 ranking["盤中判斷"] = ranking.apply(
-    lambda r: live_signal_text(float(r.get("score",0) or 0), str(r.get("setup","")),
-                               pd.to_numeric(r.get("change_pct_live"), errors="coerce")), axis=1
+    lambda r: live_signal_text(
+        float(r.get("score",0) or 0),
+        str(r.get("setup","")),
+        pd.to_numeric(r.get("change_pct_live"), errors="coerce")
+    ),
+    axis=1
 )
-
-
-# V6.3｜指定股票落選原因診斷
-st.subheader("🧪 指定股票診斷")
-diag_cols = st.columns([2,1])
-with diag_cols[0]:
-    diagnose_code = st.text_input(
-        "輸入股票代號",
-        value="",
-        max_chars=6,
-        placeholder="請輸入四位數股票代號",
-        key="diagnose_code_no_default_v1"
-    )
-with diag_cols[1]:
-    st.write("")
-    st.write("")
-    diagnose_btn = st.button("分析為什麼沒入選", use_container_width=True)
-
-# 僅在使用者真的輸入代號後才顯示診斷資料。
-_dc = str(diagnose_code or "").strip()
-if _dc:
-    if re.fullmatch(r"\d{4}", _dc):
-        _diag = diagnose_stock(
-            _dc, all_stocks, ranking, strict_pool, warrants,
-            min_stock_volume, min_turnover_m, min_liquid_warrants,
-            cfg["min_warrant_volume"]
-        )
-        d1,d2,d3,d4 = st.columns(4)
-        d1.metric("股票", f"{_diag['股票代號']} {_diag['公司名稱']}".strip())
-        d2.metric("目前排名", _diag["目前排名"] if _diag["目前排名"] is not None else "未排名")
-        d3.metric("機會分數", f"{_diag['機會分數']:.1f}" if _diag["機會分數"] is not None else "未評分")
-        d4.metric("活躍認購權證", f"{_diag['活躍認購權證數']} 張")
-
-        c1,c2,c3 = st.columns(3)
-        c1.metric("成交量門檻", _diag["成交量門檻"])
-        c2.metric("成交金額門檻", _diag["成交金額門檻"])
-        c3.metric("正式預篩", _diag["正式預篩"])
-
-        st.markdown(f"**訊號類型：** {_diag['訊號類型'] or '—'}　　**候選等級：** {_diag['候選等級'] or '—'}　　**盤中判斷：** {_diag['盤中判斷'] or '—'}")
-        st.info(f"**未進今日推薦的主要原因：** {_diag['落選原因']}")
-        st.caption(
-            f"現股成交量：{_diag['現股成交量(張)'] if _diag['現股成交量(張)'] is not None else '—'} 張｜"
-            f"成交金額：{_diag['現股成交金額(百萬元)']:.1f} 百萬元"
-            if _diag['現股成交金額(百萬元)'] is not None
-            else "成交金額：—"
-        )
-    else:
-        st.warning("請輸入四位數上市股票代號。")
 
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
@@ -857,7 +840,11 @@ with TAB_NEXT:
         if nxt.empty:
             st.info("目前沒有明確的 NEXT 候選。")
         else:
-            st.dataframe(zh_stock_table(nxt), width="stretch", hide_index=True)
+            _nshow = zh_stock_table(nxt)
+            for _c in ["盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間"]:
+                if _c in _nshow.columns:
+                    _nshow[_c] = _nshow[_c].where(pd.notna(_nshow[_c]), "等待盤中報價")
+            st.dataframe(_nshow, width="stretch", hide_index=True)
             st.caption("NEXT 不是立即買進訊號；代表條件正在接近，後續若量價/突破條件改善，可能進入今日推薦。")
 
 with TAB_WATCH:
@@ -868,7 +855,7 @@ with TAB_WATCH:
 with TAB_WARRANT:
     st.subheader("🎯 個股推薦前三名＋各自權證前五名")
     st.caption("先挑股票，再挑權證，避免單一股票的權證佔滿整張排行榜。")
-    st.caption("V6.6 會以 TWSE 基本條款＋每日成交＋MIS 盤中報價補值；Delta／IV／有效槓桿若無券商資料，會標示『需券商資料』，不再顯示 None。")
+    st.caption("V6.7 權證價格採：最後成交價 → 委買/委賣中間價 → 日資料價格；履約價/到期日由基本條款精準合併。Delta／IV／有效槓桿若無券商資料，維持『需券商資料』。")
 
 
     _base_stock = ranking.copy()

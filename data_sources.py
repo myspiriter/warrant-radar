@@ -467,17 +467,42 @@ def twse_warrant_daily_volume() -> pd.DataFrame:
     return x[x["warrant_code"].str.len() > 0].reset_index(drop=True)
 
 def merge_warrant_volume(terms: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
+    """V6.7 精準權證代號合併：
+    - 基本條款表 terms 為主表，保留履約價/到期日/發行券商等。
+    - daily 只補成交價、成交量、成交金額、交易日，不再覆蓋基本條款。
+    """
     if terms is None or terms.empty:
-        return daily if daily is not None else pd.DataFrame()
+        return daily.copy() if daily is not None else pd.DataFrame()
     if daily is None or daily.empty:
-        return terms
-    x=terms.copy()
-    x["warrant_code"]=x["warrant_code"].astype(str).str.strip()
-    cols=[c for c in ["warrant_code","price","volume","turnover","trade_date"] if c in daily.columns]
-    d=daily[cols].drop_duplicates("warrant_code",keep="last")
-    return x.drop(columns=["price","volume","turnover","trade_date"],errors="ignore").merge(
-        d,on="warrant_code",how="left"
-    )
+        return terms.copy()
+
+    x = terms.copy()
+    d = daily.copy()
+
+    x["warrant_code"] = x["warrant_code"].fillna("").astype(str).str.strip()
+    d["warrant_code"] = d["warrant_code"].fillna("").astype(str).str.strip()
+
+    # 去掉空代號，並保留 daily 每個代號最後一筆
+    x = x[x["warrant_code"].str.len() > 0]
+    d = d[d["warrant_code"].str.len() > 0].drop_duplicates("warrant_code", keep="last")
+
+    keep_daily = [c for c in ["warrant_code","price","volume","turnover","trade_date"] if c in d.columns]
+    d = d[keep_daily].copy()
+
+    out = x.merge(d, on="warrant_code", how="left", suffixes=("","_daily"))
+
+    # 若基本表本身剛好也有同名欄位，daily 只在基本表缺值時補。
+    for c in ["price","volume","turnover","trade_date"]:
+        dc = f"{c}_daily"
+        if dc in out.columns:
+            if c not in out.columns:
+                out[c] = out[dc]
+            else:
+                out[c] = out[c].combine_first(out[dc])
+            out = out.drop(columns=[dc])
+
+    return out.reset_index(drop=True)
+
 
 
 def twse_mis_quotes(codes, market="tse") -> pd.DataFrame:
@@ -576,8 +601,13 @@ def twse_warrant_mis_quotes(codes) -> pd.DataFrame:
         "quote_time":"warrant_quote_time",
     })
 
-def enrich_warrant_live(base: pd.DataFrame, max_codes=60) -> pd.DataFrame:
-    """只對成交量較高的前 N 張權證補盤中價格，降低 MIS 負載。"""
+def enrich_warrant_live(base: pd.DataFrame, max_codes=80) -> pd.DataFrame:
+    """V6.7 權證價格多層備援：
+    1) MIS 最後成交價
+    2) MIS 委買/委賣中間價
+    3) daily/open data 價格
+    同時保留委買/委賣與行情時間。
+    """
     if base is None or base.empty or "warrant_code" not in base.columns:
         return base
 
@@ -592,23 +622,42 @@ def enrich_warrant_live(base: pd.DataFrame, max_codes=60) -> pd.DataFrame:
     if q is None or q.empty:
         return x
 
-    x = x.merge(q[[
-        "warrant_code","live_price","live_bid","live_ask","live_volume","warrant_quote_time"
-    ]], on="warrant_code", how="left")
+    q = q[[
+        c for c in ["warrant_code","live_price","live_bid","live_ask","live_volume","warrant_quote_time"]
+        if c in q.columns
+    ]].drop_duplicates("warrant_code", keep="last")
 
-    # 盤中資料優先，沒有才保留日資料
-    if "price" not in x.columns: x["price"] = pd.NA
-    if "bid" not in x.columns: x["bid"] = pd.NA
-    if "ask" not in x.columns: x["ask"] = pd.NA
+    x = x.merge(q, on="warrant_code", how="left")
 
-    x["price"] = pd.to_numeric(x["live_price"], errors="coerce").combine_first(
-        pd.to_numeric(x["price"], errors="coerce")
-    )
-    x["bid"] = pd.to_numeric(x["live_bid"], errors="coerce").combine_first(
-        pd.to_numeric(x["bid"], errors="coerce")
-    )
-    x["ask"] = pd.to_numeric(x["live_ask"], errors="coerce").combine_first(
-        pd.to_numeric(x["ask"], errors="coerce")
-    )
+    for c in ["price","bid","ask"]:
+        if c not in x.columns:
+            x[c] = pd.NA
+
+    live_price = pd.to_numeric(x.get("live_price"), errors="coerce")
+    live_bid = pd.to_numeric(x.get("live_bid"), errors="coerce")
+    live_ask = pd.to_numeric(x.get("live_ask"), errors="coerce")
+    daily_price = pd.to_numeric(x["price"], errors="coerce")
+
+    midpoint = pd.Series(pd.NA, index=x.index, dtype="Float64")
+    both = live_bid.notna() & live_ask.notna() & (live_bid > 0) & (live_ask > 0)
+    midpoint.loc[both] = (live_bid.loc[both] + live_ask.loc[both]) / 2
+
+    # 僅單邊存在時，也可作為比完全空白更好的價格代理
+    one_side = midpoint.isna() & live_bid.notna() & (live_bid > 0)
+    midpoint.loc[one_side] = live_bid.loc[one_side]
+    one_side2 = midpoint.isna() & live_ask.notna() & (live_ask > 0)
+    midpoint.loc[one_side2] = live_ask.loc[one_side2]
+
+    x["price"] = live_price.combine_first(midpoint).combine_first(daily_price)
+    x["bid"] = live_bid.combine_first(pd.to_numeric(x["bid"], errors="coerce"))
+    x["ask"] = live_ask.combine_first(pd.to_numeric(x["ask"], errors="coerce"))
+
+    if "live_volume" in x.columns:
+        live_vol = pd.to_numeric(x["live_volume"], errors="coerce")
+        if "volume" in x.columns:
+            x["volume"] = live_vol.combine_first(pd.to_numeric(x["volume"], errors="coerce"))
+        else:
+            x["volume"] = live_vol
+
     return x
 

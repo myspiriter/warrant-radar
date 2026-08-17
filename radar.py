@@ -305,19 +305,100 @@ def normalize_warrant_columns(df: pd.DataFrame) -> pd.DataFrame:
     return x
 
 
-def rank_warrants(df: pd.DataFrame, underlying: str, underlying_price: float, cfg: Dict,
-                  call_only: bool = True) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame()
+def rank_warrants(df: pd.DataFrame, underlying: str, spot: float, cfg: dict) -> pd.DataFrame:
     x = normalize_warrant_columns(df)
-    x = x[x["underlying"].astype(str) == str(underlying)].copy()
-    if call_only:
-        x = x[x["warrant_type"] == "CALL"]
+    underlying = str(underlying)
+    x = x[x["underlying"].astype(str) == underlying].copy()
     if x.empty:
         return x
-    scored = x.apply(lambda r: warrant_score(r, underlying_price, cfg), axis=1, result_type="expand")
-    x = pd.concat([x.reset_index(drop=True), scored.reset_index(drop=True)], axis=1)
-    return x.sort_values(["eligible", "warrant_score", "volume"], ascending=[False, False, False])
+
+    # 認購為主
+    x = x[x["warrant_type"].fillna("CALL").eq("CALL")].copy()
+    if x.empty:
+        return x
+
+    today = pd.Timestamp.today().normalize()
+    x["expiry"] = pd.to_datetime(x["expiry"], errors="coerce")
+    x["days_to_expiry"] = (x["expiry"] - today).dt.days
+
+    x["strike"] = pd.to_numeric(x["strike"], errors="coerce")
+    if spot and spot > 0:
+        x["otm_pct"] = (x["strike"] / float(spot) - 1.0) * 100.0
+    else:
+        x["otm_pct"] = np.nan
+
+    x["price"] = pd.to_numeric(x["price"], errors="coerce")
+    x["volume"] = pd.to_numeric(x["volume"], errors="coerce").fillna(0)
+    x["bid"] = pd.to_numeric(x["bid"], errors="coerce")
+    x["ask"] = pd.to_numeric(x["ask"], errors="coerce")
+    x["delta"] = pd.to_numeric(x["delta"], errors="coerce")
+    x["iv"] = pd.to_numeric(x["iv"], errors="coerce")
+    x["effective_leverage"] = pd.to_numeric(x["effective_leverage"], errors="coerce")
+
+    # 買賣價差
+    mid = (x["bid"] + x["ask"]) / 2
+    x["spread_pct"] = np.where(
+        (x["bid"].notna()) & (x["ask"].notna()) & (mid > 0),
+        (x["ask"] - x["bid"]) / mid * 100,
+        np.nan
+    )
+
+    min_vol = float(cfg.get("min_warrant_volume", 300))
+    min_dte = float(cfg.get("min_days_to_expiry", 120))
+    max_otm = float(cfg.get("max_otm_pct", 15.0))
+
+    # 分數：公開資料可得欄位優先，缺資料不直接判死刑
+    vol_score = np.clip(np.log10(x["volume"].fillna(0) + 1) / 5 * 35, 0, 35)
+
+    dte_score = pd.Series(8.0, index=x.index)
+    dte_known = x["days_to_expiry"].notna()
+    dte_score.loc[dte_known] = np.clip((x.loc[dte_known, "days_to_expiry"] / max(min_dte,1)) * 15, 0, 15)
+
+    otm_score = pd.Series(8.0, index=x.index)
+    otm_known = x["otm_pct"].notna()
+    otm_abs = x.loc[otm_known, "otm_pct"].abs()
+    otm_score.loc[otm_known] = np.clip(20 - (otm_abs / max(max_otm,1) * 20), 0, 20)
+
+    spread_score = pd.Series(8.0, index=x.index)
+    spread_known = x["spread_pct"].notna()
+    spread_score.loc[spread_known] = np.clip(15 - x.loc[spread_known, "spread_pct"] * 1.2, 0, 15)
+
+    price_score = pd.Series(5.0, index=x.index)
+    price_known = x["price"].notna() & (x["price"] > 0)
+    price_score.loc[price_known] = 10.0
+
+    issuer_score = x["issuer"].fillna("").astype(str).str.len().gt(0).astype(float) * 5
+
+    x["warrant_score"] = (
+        vol_score + dte_score + otm_score + spread_score + price_score + issuer_score
+    ).round(1)
+
+    # 硬條件只對「已知」欄位判斷；未知欄位不因資料缺失直接淘汰。
+    eligible = x["volume"] >= min_vol
+    reasons = pd.Series("", index=x.index, dtype=object)
+
+    fail_vol = x["volume"] < min_vol
+    reasons.loc[fail_vol] += "成交量不足；"
+
+    fail_dte = x["days_to_expiry"].notna() & (x["days_to_expiry"] < min_dte)
+    eligible = eligible & ~fail_dte
+    reasons.loc[fail_dte] += "剩餘天數不足；"
+
+    fail_otm = x["otm_pct"].notna() & (x["otm_pct"] > max_otm)
+    eligible = eligible & ~fail_otm
+    reasons.loc[fail_otm] += "價外過深；"
+
+    x["eligible"] = eligible
+    x["filter_reason"] = np.where(
+        x["eligible"],
+        "通過目前可驗證條件",
+        reasons.str.rstrip("；")
+    )
+
+    return x.sort_values(
+        ["eligible","warrant_score","volume"],
+        ascending=[False,False,False]
+    ).reset_index(drop=True)
 
 
 def entry_plan(stock_row: Dict, first_amount: float, reserve_amount: float) -> Dict[str, str | float]:
