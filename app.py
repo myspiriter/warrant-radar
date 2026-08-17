@@ -646,14 +646,21 @@ ranking["盤中判斷"] = ranking.apply(
 st.subheader("🧪 指定股票診斷")
 diag_cols = st.columns([2,1])
 with diag_cols[0]:
-    diagnose_code = st.text_input("輸入股票代號", value="2376", max_chars=6, placeholder="例如：2376")
+    diagnose_code = st.text_input(
+        "輸入股票代號",
+        value="",
+        max_chars=6,
+        placeholder="請輸入四位數股票代號",
+        key="diagnose_code_no_default_v1"
+    )
 with diag_cols[1]:
     st.write("")
     st.write("")
     diagnose_btn = st.button("分析為什麼沒入選", use_container_width=True)
 
-if diagnose_btn or diagnose_code:
-    _dc = str(diagnose_code).strip()
+# 僅在使用者真的輸入代號後才顯示診斷資料。
+_dc = str(diagnose_code or "").strip()
+if _dc:
     if re.fullmatch(r"\d{4}", _dc):
         _diag = diagnose_stock(
             _dc, all_stocks, ranking, strict_pool, warrants,
@@ -679,8 +686,8 @@ if diagnose_btn or diagnose_code:
             if _diag['現股成交金額(百萬元)'] is not None
             else "成交金額：—"
         )
-    elif _dc:
-        st.warning("請輸入四位數上市股票代號，例如 2376。")
+    else:
+        st.warning("請輸入四位數上市股票代號。")
 
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
