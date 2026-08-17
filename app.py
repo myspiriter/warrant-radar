@@ -10,7 +10,7 @@ import re
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name
+from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 
 APP_DIR = Path(__file__).resolve().parent
@@ -53,15 +53,30 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
         x["標的股票"] = x["stock_code"].astype(str).map(stock_label)
     if "eligible" in x.columns:
         x["eligible"] = x["eligible"].map({True:"通過", False:"不通過"}).fillna(x["eligible"])
-    return x.rename(columns={
+
+    x = x.rename(columns={
         "stock_score":"現股分數", "warrant_code":"權證代號", "warrant_name":"權證名稱",
         "issuer":"發行券商", "price":"權證價格", "volume":"成交量(張)",
         "strike":"履約價", "expiry":"到期日", "days_to_expiry":"剩餘天數",
         "otm_pct":"價外幅度(%)", "delta":"Delta敏感度",
         "effective_leverage":"有效槓桿(倍)", "spread_pct":"買賣價差(%)",
         "iv":"隱含波動率IV(%)", "warrant_score":"權證分數",
-        "combo_score":"綜合分數", "eligible":"是否通過篩選", "filter_reason":"篩選結果"
+        "combo_score":"綜合分數", "eligible":"是否通過篩選", "filter_reason":"篩選結果",
+        "warrant_quote_time":"權證行情時間",
     })
+
+    # 不再顯示 Python None；無公開資料者用明確文字。
+    public_missing = ["發行券商","權證價格","履約價","到期日","剩餘天數","價外幅度(%)","買賣價差(%)"]
+    broker_missing = ["Delta敏感度","有效槓桿(倍)","隱含波動率IV(%)"]
+
+    for c in public_missing:
+        if c in x.columns:
+            x[c] = x[c].where(pd.notna(x[c]), "—")
+    for c in broker_missing:
+        if c in x.columns:
+            x[c] = x[c].where(pd.notna(x[c]), "需券商資料")
+
+    return x
 
 st.set_page_config(page_title="個人版權證雷達", page_icon="📡", layout="wide")
 
@@ -457,7 +472,7 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.5")
+st.title("📡 個人版台股權證雷達 V6.6")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -853,6 +868,8 @@ with TAB_WATCH:
 with TAB_WARRANT:
     st.subheader("🎯 個股推薦前三名＋各自權證前五名")
     st.caption("先挑股票，再挑權證，避免單一股票的權證佔滿整張排行榜。")
+    st.caption("V6.6 會以 TWSE 基本條款＋每日成交＋MIS 盤中報價補值；Delta／IV／有效槓桿若無券商資料，會標示『需券商資料』，不再顯示 None。")
+
 
     _base_stock = ranking.copy()
 
@@ -913,7 +930,16 @@ with TAB_WARRANT:
                     f"### {_rank}. {stock_label(_code)}｜現股分數 {float(_row.get('score',0)):.1f}"
                 )
 
-                _wr = rank_warrants(warrants, str(_code), _spot, cfg)
+                # V6.6：只針對這檔股票的權證補 MIS 盤中價格/委買/委賣。
+                _wbase = warrants[
+                    warrants["underlying"].astype(str) == str(_code)
+                ].copy() if ("underlying" in warrants.columns) else warrants.copy()
+                try:
+                    _wbase = enrich_warrant_live(_wbase, max_codes=60)
+                except Exception:
+                    pass
+
+                _wr = rank_warrants(_wbase, str(_code), _spot, cfg)
 
                 if _wr is None or _wr.empty:
                     st.info(f"{stock_label(_code)}：目前沒有可排名的權證資料。")

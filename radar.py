@@ -250,12 +250,12 @@ def normalize_warrant_columns(df: pd.DataFrame) -> pd.DataFrame:
         "warrant_code": ["warrant_code", "權證代號", "代號", "證券代號"],
         "warrant_name": ["warrant_name", "權證名稱", "名稱", "證券名稱"],
         "underlying": ["underlying", "標的代號", "標的證券代號", "標的"],
-        "issuer": ["issuer", "發行商", "發行人", "券商"],
-        "warrant_type": ["warrant_type", "類型", "權證類型", "認購售"],
-        "price": ["price", "成交價", "收盤價", "權證價格"],
+        "issuer": ["issuer", "發行券商", "發行商", "發行人", "發行證券商名稱", "券商"],
+        "warrant_type": ["warrant_type", "類型", "權證類型", "認購售", "認購（售）別"],
+        "price": ["price", "成交價", "收盤價", "最後成交價", "權證價格"],
         "volume": ["volume", "成交量", "成交數量", "成交量(張)"],
-        "strike": ["strike", "履約價", "履約價格"],
-        "expiry": ["expiry", "到期日", "最後交易日"],
+        "strike": ["strike", "履約價", "履約價格", "最新履約價格"],
+        "expiry": ["expiry", "到期日", "到期日期", "權證到期日", "最後交易日"],
         "bid": ["bid", "委買", "最佳買價"],
         "ask": ["ask", "委賣", "最佳賣價"],
         "delta": ["delta", "Delta", "DELTA"],
@@ -272,13 +272,36 @@ def normalize_warrant_columns(df: pd.DataFrame) -> pd.DataFrame:
     for c in aliases:
         if c not in x.columns:
             x[c] = np.nan
+
     x["warrant_code"] = x["warrant_code"].astype(str).str.strip()
-    x["underlying"] = x["underlying"].astype(str).str.extract(r"(\d{4,6})", expand=False).fillna(x["underlying"].astype(str))
-    for c in ["price", "volume", "strike", "bid", "ask", "delta", "iv", "effective_leverage"]:
-        x[c] = pd.to_numeric(x[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False), errors="coerce")
-    # Treat Chinese type names
+    x["warrant_name"] = x["warrant_name"].fillna("").astype(str).str.strip()
+    x["underlying"] = x["underlying"].astype(str).str.extract(
+        r"(\d{4,6})", expand=False
+    ).fillna(x["underlying"].astype(str))
+
+    for c in ["price","volume","strike","bid","ask","delta","iv","effective_leverage"]:
+        x[c] = pd.to_numeric(
+            x[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+            errors="coerce"
+        )
+
+    x["expiry"] = pd.to_datetime(x["expiry"], errors="coerce")
     x["warrant_type"] = x["warrant_type"].fillna("CALL").astype(str).apply(
-        lambda v: "PUT" if ("售" in v or "PUT" in v.upper()) else "CALL")
+        lambda v: "PUT" if ("售" in v or "PUT" in v.upper()) else "CALL"
+    )
+
+    issuers = ["元大","凱基","群益","永豐","富邦","元富","統一","國票","兆豐","中信",
+               "玉山","第一金","華南永昌","康和","國泰","台新","合庫","宏遠","亞東"]
+    def infer_issuer(row):
+        current = str(row.get("issuer") or "").strip()
+        if current and current.lower() not in ("nan","none","<na>"):
+            return current
+        name = str(row.get("warrant_name") or "")
+        for i in issuers:
+            if i in name:
+                return i
+        return ""
+    x["issuer"] = x.apply(infer_issuer, axis=1)
     return x
 
 

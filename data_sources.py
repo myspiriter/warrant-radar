@@ -230,82 +230,142 @@ def twse_all_stock_daily() -> pd.DataFrame:
     empty.attrs["source_errors"] = errors
     return empty
 
+
+def _norm_colname(s):
+    return re.sub(r"[\s（）()／/％%._\-：:]+", "", str(s)).lower()
+
+def _find_col(df, exact=(), any_terms=(), all_terms=(), exclude_terms=()):
+    """欄位名稱容錯辨識：先 exact，再關鍵字。"""
+    cols = list(df.columns)
+    norm = {c: _norm_colname(c) for c in cols}
+
+    for e in exact:
+        en = _norm_colname(e)
+        for c in cols:
+            if norm[c] == en:
+                return c
+
+    for c in cols:
+        n = norm[c]
+        if exclude_terms and any(_norm_colname(x) in n for x in exclude_terms):
+            continue
+        if all_terms and not all(_norm_colname(x) in n for x in all_terms):
+            continue
+        if any_terms and not any(_norm_colname(x) in n for x in any_terms):
+            continue
+        if all_terms or any_terms:
+            return c
+    return None
+
+def _roc_or_ad_date(v):
+    s = str(v or "").strip()
+    if not s or s.lower() in ("nan","none","<na>"):
+        return pd.NaT
+    s = s.replace("-", "/").replace(".", "/")
+    m = re.search(r"(\d{2,4})/(\d{1,2})/(\d{1,2})", s)
+    if m:
+        y, mo, d = map(int, m.groups())
+        if y < 1911:
+            y += 1911
+        try:
+            return pd.Timestamp(y, mo, d)
+        except Exception:
+            return pd.NaT
+    # YYYYMMDD / ROCYYYMMDD
+    digits = re.sub(r"\D", "", s)
+    if len(digits) == 8:
+        try:
+            return pd.Timestamp(int(digits[:4]), int(digits[4:6]), int(digits[6:8]))
+        except Exception:
+            pass
+    if len(digits) == 7:
+        try:
+            return pd.Timestamp(int(digits[:3])+1911, int(digits[3:5]), int(digits[5:7]))
+        except Exception:
+            pass
+    return pd.to_datetime(s, errors="coerce")
+
 def twse_warrant_basic() -> pd.DataFrame:
-    """TWSE 上市權證基本資料。
-    V6.2：採多欄名辨識；若官方欄名調整，至少保留代號/名稱供後續用權證名稱反推標的。
-    """
+    """V6.6 權證基本條款：不綁死欄位名稱，改用 exact + 關鍵字容錯辨識。"""
     js = _get_json("https://openapi.twse.com.tw/v1/opendata/t187ap37_L")
     df = pd.DataFrame(js)
+    if df.empty:
+        return pd.DataFrame()
 
-    aliases = {
-        "warrant_code":[
-            "權證代號","證券代號","認購（售）權證代號","認購(售)權證代號",
-            "WarrantCode","Code","公司代號"
-        ],
-        "warrant_name":[
-            "權證名稱","證券名稱","認購（售）權證名稱","認購(售)權證名稱",
-            "WarrantName","Name","公司簡稱"
-        ],
-        "underlying":[
-            "標的證券代號","標的代號","標的證券代碼","標的股票代號",
-            "標的證券","UnderlyingCode","UnderlyingSecurityCode"
-        ],
-        "underlying_name":[
-            "標的證券名稱","標的名稱","標的股票名稱","UnderlyingName"
-        ],
-        "issuer":[
-            "發行人名稱","發行券商","發行人","發行證券商名稱",
-            "IssuerName","Issuer"
-        ],
-        "warrant_type":[
-            "認購售別","認購（售）別","認購(售)別","權證類型","種類","Type"
-        ],
-        "strike":[
-            "履約價格","履約價","履約價格(元)","StrikePrice","ExercisePrice"
-        ],
-        "expiry":[
-            "到期日期","到期日","最後交易日","ExpirationDate","ExpiryDate"
-        ],
-        "ratio":[
-            "行使比例","執行比例","履約比例","ConversionRatio","ExerciseRatio"
-        ],
+    colmap = {
+        "warrant_code": _find_col(
+            df,
+            exact=["權證代號","證券代號","認購（售）權證代號","認購(售)權證代號","WarrantCode","Code"],
+            all_terms=["代號"], any_terms=["權證","證券"]
+        ),
+        "warrant_name": _find_col(
+            df,
+            exact=["權證名稱","證券名稱","認購（售）權證名稱","認購(售)權證名稱","WarrantName","Name"],
+            all_terms=["名稱"], any_terms=["權證","證券"]
+        ),
+        "underlying": _find_col(
+            df,
+            exact=["標的證券代號","標的代號","標的證券代碼","標的股票代號","UnderlyingCode"],
+            all_terms=["標的"], any_terms=["代號","代碼"]
+        ),
+        "underlying_name": _find_col(
+            df,
+            exact=["標的證券名稱","標的名稱","標的股票名稱","UnderlyingName"],
+            all_terms=["標的","名稱"]
+        ),
+        "issuer": _find_col(
+            df,
+            exact=["發行人名稱","發行證券商名稱","發行券商","發行人","IssuerName","Issuer"],
+            any_terms=["發行人","發行證券商","發行券商"]
+        ),
+        "warrant_type": _find_col(
+            df,
+            exact=["認購售別","認購（售）別","認購(售)別","權證類型","種類","Type"],
+            any_terms=["認購售","認購（售）","認購(售)","權證類型"]
+        ),
+        "strike": _find_col(
+            df,
+            exact=["履約價格","履約價","最新履約價格","最新履約價","StrikePrice","ExercisePrice"],
+            all_terms=["履約"], any_terms=["價格","價"]
+        ),
+        "expiry": _find_col(
+            df,
+            exact=["到期日期","到期日","權證到期日","ExpirationDate","ExpiryDate"],
+            all_terms=["到期"], any_terms=["日期","日"]
+        ),
+        "ratio": _find_col(
+            df,
+            exact=["行使比例","最新行使比例","履約比例","ConversionRatio","ExerciseRatio"],
+            any_terms=["行使比例","履約比例"]
+        ),
     }
 
-    ren = {}
-    for target, cands in aliases.items():
-        for c in cands:
-            if c in df.columns:
-                ren[c] = target
-                break
-
-    x = df.rename(columns=ren).copy()
-    for c in aliases:
-        if c not in x.columns:
-            x[c] = pd.NA
+    x = pd.DataFrame(index=df.index)
+    for target, source in colmap.items():
+        x[target] = df[source] if source in df.columns else pd.NA
 
     x["warrant_code"] = x["warrant_code"].fillna("").astype(str).str.strip()
     x["warrant_name"] = x["warrant_name"].fillna("").astype(str).str.strip()
     x["issuer"] = x["issuer"].fillna("").astype(str).str.strip()
     x["underlying_name"] = x["underlying_name"].fillna("").astype(str).str.strip()
-
     x["underlying"] = (
         x["underlying"].fillna("").astype(str)
-        .str.extract(r"(\d{4,6})", expand=False)
-        .fillna("")
+        .str.extract(r"(\d{4,6})", expand=False).fillna("")
     )
-
     x["strike"] = _num(x["strike"])
+    x["ratio"] = _num(x["ratio"])
+    x["expiry"] = x["expiry"].map(_roc_or_ad_date)
 
     raw_type = x["warrant_type"].fillna("").astype(str)
     nm = x["warrant_name"].fillna("").astype(str)
     x["warrant_type"] = [
-        "PUT" if ("售" in t or "PUT" in t.upper() or "售" in n) else "CALL"
+        "PUT" if ("售" in t or "put" in t.lower() or "售" in n) else "CALL"
         for t, n in zip(raw_type, nm)
     ]
 
-    x = x[x["warrant_code"].str.len() > 0].reset_index(drop=True)
-    return x
-
+    # 保留欄位偵測狀態供 App 健康檢查
+    x.attrs["detected_columns"] = {k: (v or "") for k,v in colmap.items()}
+    return x[x["warrant_code"].str.len() > 0].reset_index(drop=True)
 
 def infer_underlying_from_warrant_name(warrants: pd.DataFrame, stocks: pd.DataFrame) -> pd.DataFrame:
     """V6.2 備援：由權證名稱反推標的股票，例如「技嘉富邦61購01」→ 2376。"""
@@ -357,40 +417,54 @@ def infer_underlying_from_warrant_name(warrants: pd.DataFrame, stocks: pd.DataFr
     return out
 
 def twse_warrant_daily_volume() -> pd.DataFrame:
-    """TWSE 上市權證每日成交資料，V6.2 多欄名辨識。"""
+    """V6.6 權證每日成交：成交量之外，也嘗試辨識成交/收盤價格。"""
     js = _get_json("https://openapi.twse.com.tw/v1/opendata/t187ap42_L")
     df = pd.DataFrame(js)
+    if df.empty:
+        return pd.DataFrame()
 
-    aliases = {
-        "warrant_code":["權證代號","證券代號","認購（售）權證代號","認購(售)權證代號","WarrantCode","Code"],
-        "warrant_name":["權證名稱","證券名稱","認購（售）權證名稱","認購(售)權證名稱","WarrantName","Name"],
-        "volume":["成交數量","成交股數","成交量","成交張數","TradeVolume","Volume"],
-        "turnover":["成交金額","成交值","TradeValue","Turnover"],
-        "trade_date":["交易日期","日期","Date"],
+    colmap = {
+        "warrant_code": _find_col(
+            df, exact=["權證代號","證券代號","認購（售）權證代號","認購(售)權證代號","WarrantCode","Code"],
+            all_terms=["代號"], any_terms=["權證","證券"]
+        ),
+        "warrant_name": _find_col(
+            df, exact=["權證名稱","證券名稱","認購（售）權證名稱","認購(售)權證名稱","WarrantName","Name"],
+            all_terms=["名稱"], any_terms=["權證","證券"]
+        ),
+        "price": _find_col(
+            df, exact=["成交價","收盤價","最後成交價","權證價格","ClosingPrice","TradePrice"],
+            any_terms=["成交價","收盤價","最後成交價"]
+        ),
+        "volume": _find_col(
+            df, exact=["成交數量","成交股數","成交量","成交張數","TradeVolume","Volume"],
+            all_terms=["成交"], any_terms=["數量","股數","量","張數"]
+        ),
+        "turnover": _find_col(
+            df, exact=["成交金額","成交值","TradeValue","Turnover"],
+            all_terms=["成交"], any_terms=["金額","值"]
+        ),
+        "trade_date": _find_col(
+            df, exact=["交易日期","日期","Date"],
+            any_terms=["交易日期","日期"]
+        ),
     }
 
-    ren={}
-    for target,cands in aliases.items():
-        for c in cands:
-            if c in df.columns:
-                ren[c]=target
-                break
+    x = pd.DataFrame(index=df.index)
+    for target, source in colmap.items():
+        x[target] = df[source] if source in df.columns else pd.NA
 
-    x=df.rename(columns=ren).copy()
-    for c in aliases:
-        if c not in x.columns:
-            x[c]=pd.NA
+    x["warrant_code"] = x["warrant_code"].fillna("").astype(str).str.strip()
+    x["warrant_name"] = x["warrant_name"].fillna("").astype(str).str.strip()
+    for c in ["price","volume","turnover"]:
+        x[c] = _num(x[c])
 
-    x["warrant_code"]=x["warrant_code"].fillna("").astype(str).str.strip()
-    x["warrant_name"]=x["warrant_name"].fillna("").astype(str).str.strip()
-    x["volume"]=_num(x["volume"])
-    x["turnover"]=_num(x["turnover"])
-
-    med=x["volume"].dropna().median() if x["volume"].notna().any() else 0
+    med = x["volume"].dropna().median() if x["volume"].notna().any() else 0
     if med > 10000:
-        x["volume"]=x["volume"]/1000.0
+        x["volume"] = x["volume"] / 1000.0
 
-    return x[x["warrant_code"].str.len()>0].reset_index(drop=True)
+    x.attrs["detected_columns"] = {k: (v or "") for k,v in colmap.items()}
+    return x[x["warrant_code"].str.len() > 0].reset_index(drop=True)
 
 def merge_warrant_volume(terms: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFrame:
     if terms is None or terms.empty:
@@ -399,9 +473,11 @@ def merge_warrant_volume(terms: pd.DataFrame, daily: pd.DataFrame) -> pd.DataFra
         return terms
     x=terms.copy()
     x["warrant_code"]=x["warrant_code"].astype(str).str.strip()
-    cols=[c for c in ["warrant_code","volume","turnover","trade_date"] if c in daily.columns]
+    cols=[c for c in ["warrant_code","price","volume","turnover","trade_date"] if c in daily.columns]
     d=daily[cols].drop_duplicates("warrant_code",keep="last")
-    return x.drop(columns=["volume"],errors="ignore").merge(d,on="warrant_code",how="left")
+    return x.drop(columns=["price","volume","turnover","trade_date"],errors="ignore").merge(
+        d,on="warrant_code",how="left"
+    )
 
 
 def twse_mis_quotes(codes, market="tse") -> pd.DataFrame:
@@ -471,3 +547,68 @@ def twse_mis_quotes(codes, market="tse") -> pd.DataFrame:
             "source": "TWSE MIS",
         })
     return pd.DataFrame(rows)
+
+
+def twse_warrant_mis_quotes(codes) -> pd.DataFrame:
+    """用 MIS 補權證盤中價格、委買、委賣、成交量。
+    權證與上市證券同屬 tse channel，代號直接查詢。
+    """
+    codes = [str(c).strip() for c in codes if str(c).strip()]
+    if not codes:
+        return pd.DataFrame()
+
+    frames = []
+    for i in range(0, len(codes), 60):
+        part = codes[i:i+60]
+        q = twse_mis_quotes(part, market="tse")
+        if q is not None and not q.empty:
+            frames.append(q)
+    if not frames:
+        return pd.DataFrame()
+
+    x = pd.concat(frames, ignore_index=True).drop_duplicates("code", keep="last")
+    return x.rename(columns={
+        "code":"warrant_code",
+        "last":"live_price",
+        "bid":"live_bid",
+        "ask":"live_ask",
+        "volume_live":"live_volume",
+        "quote_time":"warrant_quote_time",
+    })
+
+def enrich_warrant_live(base: pd.DataFrame, max_codes=60) -> pd.DataFrame:
+    """只對成交量較高的前 N 張權證補盤中價格，降低 MIS 負載。"""
+    if base is None or base.empty or "warrant_code" not in base.columns:
+        return base
+
+    x = base.copy()
+    if "volume" in x.columns:
+        order = pd.to_numeric(x["volume"], errors="coerce").fillna(0).sort_values(ascending=False).index
+        codes = x.loc[order, "warrant_code"].astype(str).head(max_codes).tolist()
+    else:
+        codes = x["warrant_code"].astype(str).head(max_codes).tolist()
+
+    q = twse_warrant_mis_quotes(codes)
+    if q is None or q.empty:
+        return x
+
+    x = x.merge(q[[
+        "warrant_code","live_price","live_bid","live_ask","live_volume","warrant_quote_time"
+    ]], on="warrant_code", how="left")
+
+    # 盤中資料優先，沒有才保留日資料
+    if "price" not in x.columns: x["price"] = pd.NA
+    if "bid" not in x.columns: x["bid"] = pd.NA
+    if "ask" not in x.columns: x["ask"] = pd.NA
+
+    x["price"] = pd.to_numeric(x["live_price"], errors="coerce").combine_first(
+        pd.to_numeric(x["price"], errors="coerce")
+    )
+    x["bid"] = pd.to_numeric(x["live_bid"], errors="coerce").combine_first(
+        pd.to_numeric(x["bid"], errors="coerce")
+    )
+    x["ask"] = pd.to_numeric(x["live_ask"], errors="coerce").combine_first(
+        pd.to_numeric(x["ask"], errors="coerce")
+    )
+    return x
+
