@@ -13,6 +13,7 @@ import streamlit as st
 from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 from radar import chip_score_v611, blend_score_v611
+from radar import chip_event_v613, adjust_for_chip_event_v613
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
@@ -626,7 +627,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.12 獨立事件池：
+    """V6.13 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -701,7 +702,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
     out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
 
-    # V6.12：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    # V6.13：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
     out["事件等級"] = out["event_score"].map(event_grade)
     out = out[out["event_score"] >= 60].copy()
 
@@ -750,8 +751,19 @@ def market_summary_text(ranking, event_ranking):
     return f"今日雷達判斷：**{tone}**。一般候選 {len(ranking)} 檔，80分以上 {strong} 檔、70–79分 {good} 檔，平均 {avg:.1f} 分。事件雷達 {en} 檔達60分，其中 {estrong} 檔達80分以上。{action}"
 
 
+
+@st.cache_data(ttl=300, show_spinner=False)
+def chip_event_for_code(code):
+    try:
+        h=load_hist(str(code))
+        return chip_event_v613(h, chip=None)
+    except Exception as e:
+        return {"籌碼事件":"⚪ 無法確認","判斷信心":0,"倒貨機率":0,"換手機率":0,
+                "吸籌機率":0,"洗盤承接機率":0,"大量區防守":"—",
+                "判斷原因":f"資料取得失敗：{e}","確認階段":"—"}
+
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.12")
+st.title("📡 個人版台股權證雷達 V6.13")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -899,7 +911,7 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.12：獨立事件掃描，不經過權證活躍度預篩
+# V6.13：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
@@ -1026,7 +1038,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.12 事件雷達前10名
+    # V6.13 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1133,7 +1145,7 @@ with TAB_TODAY:
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.12 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.13 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1170,6 +1182,13 @@ with TAB_EVENT:
             axis=1
         )
 
+        # V6.13 籌碼事件辨識
+        _chip_events = _evt["code"].astype(str).map(chip_event_for_code)
+        _evt["籌碼事件"] = _chip_events.map(lambda d: d.get("籌碼事件","⚪ 無法確認"))
+        _evt["籌碼判斷信心"] = _chip_events.map(lambda d: d.get("判斷信心",0))
+        _evt["大量區防守"] = _chip_events.map(lambda d: d.get("大量區防守","—"))
+        _evt["籌碼事件原因"] = _chip_events.map(lambda d: d.get("判斷原因","—"))
+
         # 自訂事件表
         _eshow = pd.DataFrame({
             "股票": _evt["code"].astype(str).map(stock_label),
@@ -1186,6 +1205,10 @@ with TAB_EVENT:
             "反彈確認": _evt.get("event_rebound", pd.NA),
             "事件風險": _evt.get("event_risk", pd.NA),
             "事件型原因": _evt.apply(event_reason_text, axis=1),
+            "籌碼事件": _evt["籌碼事件"],
+            "籌碼判斷信心(%)": _evt["籌碼判斷信心"],
+            "大量區防守": _evt["大量區防守"],
+            "籌碼事件原因": _evt["籌碼事件原因"],
             "評分重點": _evt.get("score_reason", "—"),
         })
 
@@ -1224,6 +1247,18 @@ with TAB_EVENT:
         c4.metric("資料信心", f"{_num0(_er.get('data_confidence')):.0f}%")
 
         st.success(f"**為什麼是事件型機會：** {event_reason_text(_er)}")
+        _ce = chip_event_for_code(str(_chosen_evt))
+        st.markdown("#### 🧠 籌碼事件辨識")
+        cc1,cc2,cc3,cc4 = st.columns(4)
+        cc1.metric("籌碼事件", _ce.get("籌碼事件","—"))
+        cc2.metric("判斷信心", f"{float(_ce.get('判斷信心',0)):.0f}%")
+        cc3.metric("倒貨機率", f"{float(_ce.get('倒貨機率',0)):.0f}%")
+        cc4.metric("換手機率", f"{float(_ce.get('換手機率',0)):.0f}%")
+        cc5,cc6,cc7 = st.columns(3)
+        cc5.metric("吸籌機率", f"{float(_ce.get('吸籌機率',0)):.0f}%")
+        cc6.metric("洗盤承接機率", f"{float(_ce.get('洗盤承接機率',0)):.0f}%")
+        cc7.metric("大量區防守", _ce.get("大量區防守","—"))
+        st.caption(f"判斷原因：{_ce.get('判斷原因','—')}｜{_ce.get('確認階段','—')}")
         st.info(f"評分重點：{_er.get('score_reason','—')}")
 
         d1,d2,d3,d4,d5 = st.columns(5)
@@ -1414,7 +1449,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.12 雙軌＋獨立事件雷達
+### V6.13 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -1457,8 +1492,8 @@ with TAB_SETTINGS:
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
 
 
-# ===== V6.12 籌碼評分說明 =====
-with st.expander("🏦 V6.12 法人／大戶籌碼評分", expanded=False):
+# ===== V6.13 籌碼評分說明 =====
+with st.expander("🏦 V6.13 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -1470,4 +1505,14 @@ with st.expander("🏦 V6.12 法人／大戶籌碼評分", expanded=False):
 
 **綜合分數原則：原策略最高約 80%＋籌碼確認最高約 20%。**
 若當日法人/大戶資料尚未取得，系統不會把缺值當成賣超，也不會因此錯誤扣分。
+""")
+
+
+with st.expander("🧠 V6.13 籌碼事件辨識說明", expanded=False):
+    st.markdown("""
+系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
+判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
+
+**重要：這是機率式判讀，不代表能直接知道真正下單者身分。**
+T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)

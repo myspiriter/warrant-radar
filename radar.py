@@ -655,3 +655,129 @@ def blend_score_v611(base_score, chip_score=None, chip_confidence=1.0):
     chip100 = float(chip_score) * 5.0
     w = 0.20 * conf
     return round(base * (1.0 - w) + chip100 * w, 1)
+
+
+# ===== V6.13 籌碼事件辨識 =====
+def chip_event_v613(hist, chip=None):
+    """以價量/K線/OBV + 可用法人籌碼做機率式事件辨識。
+    回傳為初判，不把單一訊號宣稱為確定的大戶行為。
+    """
+    if hist is None or len(hist) < 6:
+        return {"籌碼事件":"⚪ 無法確認","判斷信心":0,"倒貨機率":0,"換手機率":0,
+                "吸籌機率":0,"洗盤承接機率":0,"大量區防守":"—","判斷原因":"歷史資料不足"}
+
+    x = add_indicators(hist)
+    r = x.iloc[-1]
+    prev = x.iloc[-2]
+    def s(v, d=0):
+        try:
+            return d if pd.isna(v) else float(v)
+        except Exception:
+            return d
+
+    ret1=s(r.ret1); ret3=s(r.ret3); ret5=s(r.ret5)
+    volr=s(r.volume_ratio,1); close_loc=s(r.close_location,.5)
+    obv=s(r.obv); obvma=s(r.obv_ma10,obv)
+    ma20=s(r.ma20,s(r.close)); close=s(r.close)
+    body=s(r.body_ratio,.5)
+    high=s(r.high,close); low=s(r.low,close)
+    rng=max(high-low, 1e-9)
+    upper=max(0, high-max(s(r.open,close),close))/rng
+    lower=max(0, min(s(r.open,close),close)-low)/rng
+
+    last5=x.iloc[-5:]
+    max_vol=s(last5["volume_ratio"].max(),1)
+    min_ret=s(last5["ret1"].min(),0)
+    recent_low=s(last5["low"].min(),low)
+    volume_zone_hold = close >= recent_low * 1.01
+
+    # Optional institutional confirmation.
+    chip = chip or {}
+    f5=s(chip.get("外資5日",0)); t5=s(chip.get("投信5日",0))
+    inst=f5+t5
+    chip_known = bool(chip)
+
+    dump=0; turnover=0; accumulation=0; wash=0
+    dump_reasons=[]; turn_reasons=[]; acc_reasons=[]; wash_reasons=[]
+
+    # 疑似倒貨 / 高檔派發
+    if volr>=1.8: dump+=18; dump_reasons.append("成交量明顯放大")
+    if upper>=0.35: dump+=20; dump_reasons.append("長上影/盤中拉高後回落")
+    if close_loc<=0.35: dump+=18; dump_reasons.append("收盤位置偏弱")
+    if ret1<0: dump+=12
+    if close<ma20 and ret5<0: dump+=12; dump_reasons.append("跌破中期支撐")
+    if obv<obvma: dump+=10; dump_reasons.append("OBV轉弱")
+    if chip_known and inst<0: dump+=10; dump_reasons.append("外資+投信偏賣")
+
+    # 籌碼換手
+    if max_vol>=1.8: turnover+=18; turn_reasons.append("近期出現大量成交")
+    if abs(ret1)<=0.045: turnover+=14; turn_reasons.append("爆量但價格未失控")
+    if close_loc>=0.45: turnover+=14; turn_reasons.append("收盤仍有承接")
+    if volume_zone_hold: turnover+=18; turn_reasons.append("大量區低點仍守住")
+    if ret3>-0.04: turnover+=12
+    if volr<max_vol*.8 and max_vol>=1.8: turnover+=12; turn_reasons.append("爆量後量能收斂")
+    if obv>=obvma: turnover+=12; turn_reasons.append("OBV未明顯破壞")
+
+    # 疑似吸籌
+    if -0.04<=ret5<=0.05: accumulation+=12
+    if close>=ma20*.97: accumulation+=12
+    if obv>obvma: accumulation+=22; acc_reasons.append("OBV強於均線")
+    if lower>=0.25: accumulation+=12; acc_reasons.append("下檔承接明顯")
+    if close_loc>=0.6: accumulation+=12
+    if chip_known and inst>0: accumulation+=22; acc_reasons.append("外資+投信近5日偏買")
+    if volr>=1.1 and ret1>=0: accumulation+=10
+
+    # 洗盤後承接
+    if min_ret<=-0.045: wash+=18; wash_reasons.append("近期曾急跌")
+    if max_vol>=1.5: wash+=14; wash_reasons.append("急跌伴隨大量")
+    if lower>=0.25 or close_loc>=0.6: wash+=18; wash_reasons.append("低檔出現承接")
+    if ret3>-0.02: wash+=14; wash_reasons.append("短線開始止穩")
+    if volume_zone_hold: wash+=14; wash_reasons.append("未跌破大量區低點")
+    if obv>=obvma: wash+=10
+    if chip_known and inst>0: wash+=12; wash_reasons.append("法人出現回補")
+
+    probs = {
+        "🔴 疑似大戶倒貨": min(95,dump),
+        "🔄 籌碼換手": min(95,turnover),
+        "🟢 疑似大戶吸籌": min(95,accumulation),
+        "🔥 洗盤後承接": min(95,wash),
+    }
+    event=max(probs,key=probs.get)
+    confidence=float(probs[event])
+    if confidence<55:
+        event="⚪ 無法確認"
+    reason_map={
+        "🔴 疑似大戶倒貨":dump_reasons,
+        "🔄 籌碼換手":turn_reasons,
+        "🟢 疑似大戶吸籌":acc_reasons,
+        "🔥 洗盤後承接":wash_reasons,
+    }
+    reasons=reason_map.get(event,[])
+    return {
+        "籌碼事件":event,
+        "判斷信心":round(confidence,1),
+        "倒貨機率":round(float(probs["🔴 疑似大戶倒貨"]),1),
+        "換手機率":round(float(probs["🔄 籌碼換手"]),1),
+        "吸籌機率":round(float(probs["🟢 疑似大戶吸籌"]),1),
+        "洗盤承接機率":round(float(probs["🔥 洗盤後承接"]),1),
+        "大量區防守":"✅ 守住" if volume_zone_hold else "❌ 失守",
+        "判斷原因":"；".join(reasons[:4]) if reasons else "訊號互相矛盾，暫不確認",
+        "確認階段":"T日初判；建議用T+1～T+3價格與量能持續確認"
+    }
+
+
+def adjust_for_chip_event_v613(score, event_info):
+    """只做有限度降/加權，避免籌碼事件單獨主宰總分。"""
+    base=float(score or 0)
+    event=(event_info or {}).get("籌碼事件","")
+    conf=float((event_info or {}).get("判斷信心",0) or 0)
+    factor=max(0,min(1,conf/100))
+    if "倒貨" in event:
+        base -= 12*factor
+    elif "洗盤後承接" in event:
+        base += 6*factor
+    elif "吸籌" in event:
+        base += 5*factor
+    elif "換手" in event:
+        base += 3*factor
+    return round(max(0,min(100,base)),1)
