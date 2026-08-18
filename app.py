@@ -35,14 +35,14 @@ def zh_stock_table(df: pd.DataFrame) -> pd.DataFrame:
     if "code" in x.columns:
         x["股票"] = x["code"].astype(str).map(stock_label)
     x = x.rename(columns={
-        "score":"機會分數", "setup":"訊號類型", "close":"前收/日線收盤價",
+        "score":"機會分數", "setup":"訊號類型", "close":"前收/日線收盤價", "data_confidence":"資料信心(%)", "score_reason":"評分重點", "candidate_status":"候選狀態",
         "ret1_pct":"日線漲跌幅(%)", "ret5_pct":"近5日漲跌幅(%)",
-        "volume_ratio":"日線量比", "rsi14":"RSI強弱指標", "ma20":"20日均線",
+        "volume_ratio":"日線量比", "rsi14":"RSI強弱指標", "ma20":"20日均線", "breakout_quality":"突破品質", "support":"支撐承接", "risk":"風險控制", "consistency":"穩定性",
         "last":"盤中成交價", "bid":"盤中委買", "ask":"盤中委賣",
         "change_pct_live":"盤中漲跌幅(%)", "volume_live":"盤中累計量",
         "quote_time":"行情時間"
     })
-    cols=[c for c in ["股票","機會分數","候選等級","盤中判斷","訊號類型","盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間","前收/日線收盤價","日線漲跌幅(%)","近5日漲跌幅(%)","日線量比","RSI強弱指標","20日均線"] if c in x.columns]
+    cols=[c for c in ["股票","機會分數","候選等級","候選狀態","資料信心(%)","盤中判斷","訊號類型","評分重點","盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間","前收/日線收盤價","日線漲跌幅(%)","近5日漲跌幅(%)","日線量比","RSI強弱指標","突破品質","支撐承接","風險控制","穩定性","20日均線"] if c in x.columns]
     return x[cols]
 
 def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
@@ -164,6 +164,66 @@ def load_cfg():
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
+LAST_RANKING_PATH = Path("/tmp/warrant_radar_last_ranking.csv")
+
+def load_last_ranking():
+    try:
+        if LAST_RANKING_PATH.exists():
+            return pd.read_csv(LAST_RANKING_PATH, dtype={"code":str})
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def save_last_ranking(df):
+    try:
+        if df is not None and not df.empty:
+            df.to_csv(LAST_RANKING_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+
+def preserve_missing_high_score(current: pd.DataFrame, previous: pd.DataFrame,
+                                prior_threshold=70, max_keep=10):
+    """V6.8 候選防消失。
+    前次高分股若本次因資料/預篩關聯而完全消失，保留在 ranking 內，
+    但降為『等待資料確認』且不允許直接進今日推薦。
+    """
+    if previous is None or previous.empty:
+        return current
+    if current is None:
+        current = pd.DataFrame()
+
+    prev = previous.copy()
+    if "score" not in prev.columns or "code" not in prev.columns:
+        return current
+
+    prev["score"] = pd.to_numeric(prev["score"], errors="coerce").fillna(0)
+    prev = prev[prev["score"] >= prior_threshold].sort_values("score", ascending=False)
+
+    cur_codes = set(current["code"].astype(str)) if (not current.empty and "code" in current.columns) else set()
+    keep = prev[~prev["code"].astype(str).isin(cur_codes)].head(max_keep).copy()
+    if keep.empty:
+        if not current.empty:
+            current["candidate_status"] = current.get("candidate_status", "本次正常")
+        return current
+
+    keep["last_score"] = keep["score"]
+    keep["score"] = (keep["score"] * 0.88).clip(upper=69.0).round(1)
+    keep["setup"] = "資料待確認"
+    keep["candidate_status"] = "前次高分保留"
+    keep["score_reason"] = "前次為高分候選，本次未進候選池；先保留觀察，等待資料/預篩確認"
+    keep["data_confidence"] = 40.0
+
+    if current.empty:
+        out = keep
+    else:
+        cur = current.copy()
+        if "candidate_status" not in cur.columns:
+            cur["candidate_status"] = "本次正常"
+        out = pd.concat([cur, keep], ignore_index=True, sort=False)
+
+    out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0)
+    return out.sort_values("score", ascending=False).reset_index(drop=True)
+
 def save_signal_snapshot(ranking: pd.DataFrame):
     if ranking.empty:
         return
@@ -240,7 +300,9 @@ def build_dynamic_pool(all_stocks: pd.DataFrame, wb: pd.DataFrame, wv: pd.DataFr
 def dynamic_ranking(pool: pd.DataFrame):
     base_cols = [
         "code","name","活躍權證數","現股成交量(張)","現股成交金額",
-        "score","setup","close","ret1_pct","ret5_pct","volume_ratio","rsi14","ma20"
+        "score","raw_score","setup","close","ret1_pct","ret5_pct","ret20_pct",
+        "volume_ratio","rsi14","ma20","breakout_quality","support","risk","consistency",
+        "data_confidence","score_reason"
     ]
     if pool is None or pool.empty:
         return pd.DataFrame(columns=base_cols)
@@ -472,7 +534,7 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.7")
+st.title("📡 個人版台股權證雷達 V6.8")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -571,6 +633,8 @@ with st.sidebar:
     uploaded=st.file_uploader("補充券商權證 CSV（可選）",type=["csv"])
     st.caption("官方資料可做每日掃描；若要 Delta、IV、即時買賣價差，仍建議補充券商資料或未來串接即時行情。")
 
+previous_ranking = load_last_ranking()
+
 if scan_mode:
     funnel_df = screening_funnel(
         all_stocks, wbasic, wvol,
@@ -609,6 +673,12 @@ else:
     strict_pool = pd.DataFrame()
     with st.spinner("更新固定關注股…"):
         ranking = stock_ranking(watchlist)
+
+# V6.8：前次高分候選若因本次資料/預篩問題消失，保留為「資料待確認」
+if scan_mode:
+    ranking = preserve_missing_high_score(ranking, previous_ranking, prior_threshold=70, max_keep=10)
+
+save_last_ranking(ranking)
 
 # 固定關注股另外計算，不受每日 TOP 排名限制
 with st.spinner("更新我的關注股…"):
@@ -674,6 +744,14 @@ required_ranking_cols = {
     "volume_ratio": pd.NA,
     "rsi14": pd.NA,
     "ma20": pd.NA,
+    "breakout_quality": pd.NA,
+    "support": pd.NA,
+    "risk": pd.NA,
+    "consistency": pd.NA,
+    "data_confidence": pd.NA,
+    "score_reason": "",
+    "candidate_status": "本次正常",
+    "last_score": pd.NA,
 }
 if ranking is None or not isinstance(ranking, pd.DataFrame):
     ranking = pd.DataFrame(columns=list(required_ranking_cols.keys()))
@@ -683,6 +761,9 @@ for _col, _default in required_ranking_cols.items():
 ranking["score"] = pd.to_numeric(ranking["score"], errors="coerce").fillna(0)
 ranking["setup"] = ranking["setup"].fillna("資料不足").astype(str)
 ranking["候選等級"] = ranking["score"].map(candidate_grade)
+if "candidate_status" in ranking.columns:
+    _preserved = ranking["candidate_status"].eq("前次高分保留")
+    ranking.loc[_preserved, "候選等級"] = "🟠 前次高分／待確認"
 
 # V6.7 盤中行情覆蓋
 # 不再只抓 ranking 前 N 名；改成：
@@ -754,7 +835,8 @@ with TAB_TODAY:
     st.subheader("今日推薦")
     recommended = ranking[
         (pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 70) &
-        (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足"]))
+        (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"])) &
+        (~ranking["candidate_status"].eq("前次高分保留"))
     ].copy()
 
     if recommended.empty:
@@ -785,9 +867,11 @@ with TAB_TODAY:
         with right:
             st.markdown(f"### {stock_label(chosen)}｜{sr.get('setup','')}")
             st.metric("現股分數", f"{sr.get('score',0):.1f}/100")
-            st.write(f"趨勢 {sr.get('trend',0)}/20｜量價 {sr.get('volume_price',0)}/20")
-            st.write(f"位置 {sr.get('position',0)}/15｜動能 {sr.get('momentum',0)}/15")
-            st.write(f"事件 {sr.get('event',0)}/15｜基本面代理 {sr.get('fundamental_proxy',0)}/15")
+            st.write(f"趨勢 {sr.get('trend',0)}/18｜量價 {sr.get('volume_price',0)}/14｜動能 {sr.get('momentum',0)}/12")
+            st.write(f"位置 {sr.get('position',0)}/12｜突破品質 {sr.get('breakout_quality',0)}/12｜支撐承接 {sr.get('support',0)}/10")
+            st.write(f"風險控制 {sr.get('risk',0)}/10｜穩定性 {sr.get('consistency',0)}/12")
+            st.write(f"**資料信心：** {sr.get('data_confidence','—')}%")
+            st.caption(f"評分重點：{sr.get('score_reason','—')}")
             plan = entry_plan(sr, first_amount, reserve_amount)
             st.info(plan["instruction"])
             st.write("**加碼條件：**", plan["add_rule"])
@@ -984,6 +1068,14 @@ with TAB_WARRANT:
                     )
 
 with TAB_SETTINGS:
+    st.markdown("""
+### V6.8 評分架構
+現股機會分數改為八大因子，共100分：  
+**趨勢18｜量價14｜動能12｜位置12｜突破品質12｜支撐承接10｜風險控制10｜穩定性12。**
+
+另外加入「資料信心」與「前次高分防消失」機制。前次≥70分的股票若本次只是因資料/預篩缺失消失，
+會降為 **🟠 前次高分／待確認**，不會直接從雷達消失，也不會被誤列為正式今日推薦。
+""")
     st.markdown("""
 ### 現股 100 分
 - 趨勢 20：均線排列、20日方向
