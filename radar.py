@@ -568,3 +568,90 @@ def entry_plan(stock_row: Dict, first_amount: float, reserve_amount: float) -> D
         "stop_rule": "無持倉則不需停損；已有持倉以20日線/前低為風控參考。"
     }
 
+
+
+# ===== V6.11 法人／大戶籌碼評分 =====
+def chip_score_v611(
+    foreign_1d=0, foreign_3d=0, foreign_5d=0,
+    trust_1d=0, trust_3d=0, trust_5d=0,
+    dealer_1d=0, dealer_3d=0, dealer_5d=0,
+    foreign_streak=0, trust_streak=0,
+    large_holder_change=None, price_5d=None
+):
+    """
+    回傳 0~20 分的法人/大戶籌碼分數與中文判斷。
+    金額/張數可使用同一方向性的任意單位；重點是正負與相對強弱。
+    large_holder_change: 大戶持股比例變化(百分點)，無資料可為 None。
+    price_5d: 近5日漲跌幅(%)，用於法人/股價背離判斷。
+    """
+    vals = [foreign_1d, foreign_3d, foreign_5d, trust_1d, trust_3d, trust_5d,
+            dealer_1d, dealer_3d, dealer_5d]
+    vals = [0 if v is None else float(v) for v in vals]
+    (f1,f3,f5,t1,t3,t5,d1,d3,d5) = vals
+
+    score = 10.0  # 中性起點
+
+    # 外資：最高 4 分影響
+    score += 1.0 if f1 > 0 else (-1.0 if f1 < 0 else 0)
+    score += 1.2 if f3 > 0 else (-1.2 if f3 < 0 else 0)
+    score += 1.8 if f5 > 0 else (-1.8 if f5 < 0 else 0)
+
+    # 投信：最高 4.5 分影響，較重視連續性
+    score += 1.0 if t1 > 0 else (-1.0 if t1 < 0 else 0)
+    score += 1.5 if t3 > 0 else (-1.5 if t3 < 0 else 0)
+    score += 2.0 if t5 > 0 else (-2.0 if t5 < 0 else 0)
+
+    # 自營商：輔助訊號
+    score += 0.4 if d3 > 0 else (-0.4 if d3 < 0 else 0)
+    score += 0.6 if d5 > 0 else (-0.6 if d5 < 0 else 0)
+
+    # 連買/連賣
+    score += max(-1.5, min(1.5, float(foreign_streak or 0) * 0.3))
+    score += max(-2.0, min(2.0, float(trust_streak or 0) * 0.4))
+
+    # 大戶持股比例變化（資料存在才計分）
+    if large_holder_change is not None:
+        c = float(large_holder_change)
+        score += max(-2.0, min(2.0, c * 2.0))
+
+    # 法人與股價背離：跌價法人買 → 加分；漲價法人賣 → 扣分
+    if price_5d is not None:
+        institutional_5d = f5 + t5
+        p = float(price_5d)
+        if p < 0 and institutional_5d > 0:
+            score += 1.5
+        elif p > 0 and institutional_5d < 0:
+            score -= 1.5
+
+    score = round(max(0.0, min(20.0, score)), 1)
+    if score >= 15:
+        label = "🟢 法人偏多"
+    elif score >= 8:
+        label = "🟡 籌碼中性"
+    else:
+        label = "🔴 法人偏空"
+
+    return {
+        "籌碼分數": score,
+        "籌碼判斷": label,
+        "外資1日": f1, "外資3日": f3, "外資5日": f5,
+        "投信1日": t1, "投信3日": t3, "投信5日": t5,
+        "自營商1日": d1, "自營商3日": d3, "自營商5日": d5,
+        "外資連買天數": foreign_streak or 0,
+        "投信連買天數": trust_streak or 0,
+        "大戶趨勢": "資料待取得" if large_holder_change is None else large_holder_change,
+    }
+
+
+def blend_score_v611(base_score, chip_score=None, chip_confidence=1.0):
+    """
+    V6.11 綜合分數：原模型 80% + 籌碼面 20%。
+    若籌碼資料缺漏，依 confidence 降低籌碼影響，避免缺資料被誤判為空頭。
+    """
+    base = float(base_score or 0)
+    if chip_score is None:
+        return round(base, 1)
+    conf = max(0.0, min(1.0, float(chip_confidence)))
+    chip100 = float(chip_score) * 5.0
+    w = 0.20 * conf
+    return round(base * (1.0 - w) + chip100 * w, 1)

@@ -12,6 +12,7 @@ import streamlit as st
 
 from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
+from radar import chip_score_v611, blend_score_v611
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
@@ -625,7 +626,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.10 獨立事件池：
+    """V6.11 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -700,7 +701,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
     out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
 
-    # V6.10：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    # V6.11：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
     out["事件等級"] = out["event_score"].map(event_grade)
     out = out[out["event_score"] >= 60].copy()
 
@@ -711,7 +712,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.10")
+st.title("📡 個人版台股權證雷達 V6.11")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -859,7 +860,7 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.10：獨立事件掃描，不經過權證活躍度預篩
+# V6.11：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
@@ -986,7 +987,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.10 事件雷達前10名
+    # V6.11 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1090,7 +1091,7 @@ with TAB_TODAY:
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.10 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.11 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1369,7 +1370,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.10 雙軌＋獨立事件雷達
+### V6.11 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -1410,3 +1411,19 @@ with TAB_SETTINGS:
 """)
 
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
+
+
+# ===== V6.11 籌碼評分說明 =====
+with st.expander("🏦 V6.11 法人／大戶籌碼評分", expanded=False):
+    st.markdown("""
+**新增籌碼觀測（最高 20 分）**
+
+- 外資：近 1 / 3 / 5 日買賣超與連續買賣方向
+- 投信：近 1 / 3 / 5 日買賣超，連續買超權重較高
+- 自營商：作為輔助訊號
+- 大戶：公開資料可取得時納入持股集中度變化
+- 籌碼背離：股價下跌但外資＋投信買超加分；股價上漲但法人賣超扣分
+
+**綜合分數原則：原策略最高約 80%＋籌碼確認最高約 20%。**
+若當日法人/大戶資料尚未取得，系統不會把缺值當成賣超，也不會因此錯誤扣分。
+""")
