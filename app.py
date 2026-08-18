@@ -610,8 +610,108 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
     return result
 
 
+
+def event_grade(score):
+    s = pd.to_numeric(pd.Series([score]), errors="coerce").fillna(0).iloc[0]
+    if s >= 80:
+        return "🔥 強力事件機會"
+    if s >= 70:
+        return "🟢 事件型推薦"
+    if s >= 60:
+        return "🟡 事件型觀察"
+    return "未達事件門檻"
+
+def build_event_pool(all_stocks: pd.DataFrame,
+                     min_stock_volume=1000,
+                     min_turnover_m=50,
+                     max_candidates=120):
+    """V6.10 獨立事件池：
+    只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
+    """
+    if all_stocks is None or all_stocks.empty:
+        return pd.DataFrame()
+
+    s = all_stocks.copy()
+    s["code"] = s["code"].astype(str).str.strip()
+    s = s[s["code"].str.fullmatch(r"\d{4}", na=False)].copy()
+
+    s["volume_lots"] = pd.to_numeric(s.get("volume_lots"), errors="coerce").fillna(0)
+    s["turnover"] = pd.to_numeric(s.get("turnover"), errors="coerce").fillna(0)
+
+    s = s[
+        (s["volume_lots"] >= min_stock_volume) &
+        (s["turnover"] >= min_turnover_m * 1_000_000)
+    ].copy()
+
+    if s.empty:
+        return s
+
+    s["_流動性分"] = (
+        s["turnover"].rank(pct=True) * 65 +
+        s["volume_lots"].rank(pct=True) * 35
+    )
+    return s.sort_values("_流動性分", ascending=False).head(max_candidates).reset_index(drop=True)
+
+def event_dynamic_ranking(event_pool: pd.DataFrame):
+    """只做事件型評分，不依賴權證門檻。"""
+    base_cols = [
+        "code","name","score","trend_score","event_score","score_mode","setup",
+        "data_confidence","score_reason","close","ret1_pct","ret5_pct","ret20_pct",
+        "volume_ratio","rsi14","ma20",
+        "event_shock","event_washout","event_stabilization","event_rebound","event_risk"
+    ]
+    if event_pool is None or event_pool.empty:
+        return pd.DataFrame(columns=base_cols)
+
+    rows = []
+    for _, r in event_pool.iterrows():
+        code = str(r.get("code","")).strip()
+        if not code:
+            continue
+        try:
+            h = load_hist(code)
+            s = stock_score(h)
+            row = {
+                "code": code,
+                "name": r.get("name",""),
+                "現股成交量(張)": r.get("volume_lots", pd.NA),
+                "現股成交金額": r.get("turnover", pd.NA),
+            }
+            if isinstance(s, dict):
+                row.update(s)
+            rows.append(row)
+        except Exception as e:
+            rows.append({
+                "code":code, "name":r.get("name",""),
+                "score":0, "event_score":0, "trend_score":0,
+                "score_mode":"資料錯誤", "setup":"資料錯誤",
+                "score_reason":str(e)
+            })
+
+    if not rows:
+        return pd.DataFrame(columns=base_cols)
+
+    out = pd.DataFrame(rows)
+    for c in base_cols:
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0)
+    out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
+    out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
+
+    # V6.10：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    out["事件等級"] = out["event_score"].map(event_grade)
+    out = out[out["event_score"] >= 60].copy()
+
+    return out.sort_values(
+        ["event_score","score"],
+        ascending=[False,False]
+    ).reset_index(drop=True)
+
+
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.9")
+st.title("📡 個人版台股權證雷達 V6.10")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -759,6 +859,16 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
+# V6.10：獨立事件掃描，不經過權證活躍度預篩
+event_pool = build_event_pool(
+    all_stocks,
+    min_stock_volume=min_stock_volume,
+    min_turnover_m=min_turnover_m,
+    max_candidates=120
+)
+with st.spinner("掃描全市場事件型機會…"):
+    event_ranking = event_dynamic_ranking(event_pool)
+
 # 固定關注股另外計算，不受每日 TOP 排名限制
 with st.spinner("更新我的關注股…"):
     watch_ranking=stock_ranking(watchlist)
@@ -876,6 +986,10 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
+    # V6.10 事件雷達前10名
+    if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
+        _codes += event_ranking.head(10)["code"].astype(str).tolist()
+
     # 去重
     _codes = list(dict.fromkeys([c for c in _codes if re.fullmatch(r"\d{4}", str(c))]))
 
@@ -909,7 +1023,8 @@ c1,c2,c3,c4 = st.columns(4)
 valid = ranking[pd.to_numeric(ranking["score"], errors="coerce").fillna(0) > 0].copy()
 c1.metric("今日候選", len(ranking))
 c2.metric("80分以上強力候選", int((pd.to_numeric(valid["score"], errors="coerce").fillna(0) >= 80).sum()))
-c3.metric("事件型反彈", int((valid["setup"] == "事件型反彈").sum()))
+_event80 = int((pd.to_numeric(event_ranking["event_score"], errors="coerce").fillna(0) >= 80).sum()) if event_ranking is not None and not event_ranking.empty else 0
+c3.metric("80分以上事件機會", _event80)
 c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破型"]).sum()))
 
 TAB_TODAY, TAB_EVENT, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
@@ -974,31 +1089,104 @@ with TAB_TODAY:
 
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
-    st.caption("專門追蹤爆量急跌、恐慌洗盤、事件衝擊後止穩反彈型股票。")
-    _evt = ranking[
-        ranking["score_mode"].isin(["事件型模型","事件追蹤"]) |
-        ranking["setup"].isin(["事件型機會","事件型反彈","事件追蹤"])
-    ].copy()
+    st.caption(
+        "V6.10 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
+    )
 
-    if _evt.empty:
-        st.info("目前沒有事件型候選。")
+    if event_ranking is None or event_ranking.empty:
+        st.info("目前沒有事件分數達 60 分以上的股票。")
     else:
-        _evt = _evt.sort_values(["event_score","score"], ascending=False, na_position="last").head(10)
-        st.dataframe(zh_stock_table(_evt), width="stretch", hide_index=True)
+        _evt = event_ranking.copy().head(15)
+
+        # 補盤中報價
+        if intraday_mode:
+            try:
+                _ecodes = _evt["code"].astype(str).tolist()
+                _elive = load_live_quotes(tuple(_ecodes))
+                if _elive is not None and not _elive.empty:
+                    _cols = [c for c in [
+                        "code","last","bid","ask","volume_live",
+                        "change_pct_live","quote_date","quote_time"
+                    ] if c in _elive.columns]
+                    _evt = _evt.merge(
+                        _elive[_cols].drop_duplicates("code", keep="last"),
+                        on="code", how="left"
+                    )
+            except Exception:
+                pass
+
+        _evt["候選等級"] = _evt["event_score"].map(event_grade)
+        _evt["candidate_status"] = "事件獨立掃描"
+        _evt["盤中判斷"] = _evt.apply(
+            lambda r: live_signal_text(
+                float(pd.to_numeric(r.get("event_score"), errors="coerce") or 0),
+                "事件型機會",
+                pd.to_numeric(r.get("change_pct_live"), errors="coerce")
+            ),
+            axis=1
+        )
+
+        # 自訂事件表
+        _eshow = pd.DataFrame({
+            "股票": _evt["code"].astype(str).map(stock_label),
+            "事件分數": _evt["event_score"],
+            "趨勢分數": _evt["trend_score"],
+            "事件等級": _evt["event_score"].map(event_grade),
+            "資料信心(%)": _evt.get("data_confidence", pd.NA),
+            "盤中判斷": _evt.get("盤中判斷", "—"),
+            "盤中成交價": _evt.get("last", pd.NA),
+            "盤中漲跌幅(%)": _evt.get("change_pct_live", pd.NA),
+            "事件衝擊": _evt.get("event_shock", pd.NA),
+            "洗盤品質": _evt.get("event_washout", pd.NA),
+            "止穩": _evt.get("event_stabilization", pd.NA),
+            "反彈確認": _evt.get("event_rebound", pd.NA),
+            "事件風險": _evt.get("event_risk", pd.NA),
+            "評分重點": _evt.get("score_reason", "—"),
+        })
+
+        for _c in _eshow.columns:
+            if _c != "事件分數":
+                _eshow[_c] = _eshow[_c].where(pd.notna(_eshow[_c]), "—")
+
+        st.dataframe(
+            _eshow,
+            width="stretch",
+            hide_index=True,
+            column_config={
+                "事件分數": st.column_config.ProgressColumn(
+                    "事件分數", min_value=0, max_value=100, format="%.1f"
+                )
+            }
+        )
 
         _ecodes = _evt["code"].astype(str).tolist()
-        _chosen_evt = st.selectbox("查看事件型個股", _ecodes, format_func=stock_label, key="event_stock")
+        _chosen_evt = st.selectbox(
+            "查看事件型個股",
+            _ecodes,
+            format_func=stock_label,
+            key="event_stock_v610"
+        )
         _er = _evt[_evt["code"].astype(str) == str(_chosen_evt)].iloc[0]
 
-        c1,c2,c3,c4 = st.columns(4)
-        def _fmt(v):
+        def _num0(v):
             vv = pd.to_numeric(v, errors="coerce")
             return float(vv) if pd.notna(vv) else 0.0
-        c1.metric("最終分數", f"{_fmt(_er.get('score')):.1f}")
-        c2.metric("事件分數", f"{_fmt(_er.get('event_score')):.1f}")
-        c3.metric("趨勢分數", f"{_fmt(_er.get('trend_score')):.1f}")
-        c4.metric("資料信心", f"{_fmt(_er.get('data_confidence')):.0f}%")
+
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("事件分數", f"{_num0(_er.get('event_score')):.1f}")
+        c2.metric("趨勢分數", f"{_num0(_er.get('trend_score')):.1f}")
+        c3.metric("事件等級", event_grade(_num0(_er.get("event_score"))))
+        c4.metric("資料信心", f"{_num0(_er.get('data_confidence')):.0f}%")
+
         st.info(f"評分重點：{_er.get('score_reason','—')}")
+
+        d1,d2,d3,d4,d5 = st.columns(5)
+        d1.metric("事件衝擊", f"{_num0(_er.get('event_shock')):.0f}/20")
+        d2.metric("洗盤品質", f"{_num0(_er.get('event_washout')):.0f}/20")
+        d3.metric("止穩", f"{_num0(_er.get('event_stabilization')):.0f}/20")
+        d4.metric("反彈確認", f"{_num0(_er.get('event_rebound')):.0f}/20")
+        d5.metric("事件風險", f"{_num0(_er.get('event_risk')):.0f}/20")
 
 with TAB_YDAY:
     st.subheader("昨日訊號追蹤")
@@ -1181,12 +1369,12 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.9 雙軌模型
+### V6.10 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
 事件型模型包含：事件衝擊、洗盤品質、止穩、反彈確認、事件風險五部分，共100分。
-事件型高分股會持續追蹤約5天，不會因一次刷新或預篩資料缺失直接消失。
+事件雷達現在獨立掃描全市場高流動性股票，不先經過權證門檻。事件分數≥60就顯示；80分以上為強力事件機會。
 """)
     st.markdown("""
 ### V6.8 評分架構
