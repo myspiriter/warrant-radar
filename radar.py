@@ -99,66 +99,32 @@ def _safe(v, default=0.0):
 
 
 def stock_score(hist: pd.DataFrame) -> Dict[str, float | str]:
-    """V6.8 多因子評分（100分）。
-
-    八大因子：
-    趨勢18、量價14、動能12、位置12、突破品質12、
-    支撐/承接10、波動風險10、穩定性12。
-
-    另外輸出資料完整度/信心值與加扣分摘要。
-    """
+    """V6.9 雙軌評分：一般趨勢模型 + 事件型模型。"""
     if hist is None or len(hist) < 22:
-        return {
-            "score": 0, "raw_score": 0, "setup": "資料不足",
-            "trend": 0, "volume_price": 0, "momentum": 0, "position": 0,
-            "breakout_quality": 0, "support": 0, "risk": 0, "consistency": 0,
-            "data_confidence": 0, "score_reason": "歷史資料不足"
-        }
+        return {"score":0, "trend_score":0, "event_score":0, "score_mode":"資料不足",
+                "setup":"資料不足", "data_confidence":0, "score_reason":"歷史資料不足"}
 
     x = add_indicators(hist)
-    r = x.iloc[-1]
-    prev = x.iloc[-2]
-
-    close = _safe(r.close)
-    ma5 = _safe(r.ma5, close)
-    ma10 = _safe(r.ma10, close)
-    ma20 = _safe(r.ma20, close)
-    ma60 = _safe(r.ma60, ma20)
-    volr = _safe(r.volume_ratio, 1)
-    ret1 = _safe(r.ret1, 0)
-    ret3 = _safe(r.ret3, 0)
-    ret5 = _safe(r.ret5, 0)
-    ret10 = _safe(r.ret10, 0)
-    ret20 = _safe(r.ret20, 0)
-    rsi = _safe(r.rsi14, 50)
-    dist20 = _safe(r.dist_ma20, 0)
-    macd_hist = _safe(r.macd_hist, 0)
-    prev_macd_hist = _safe(prev.macd_hist, 0)
-    atr_pct = _safe(r.atr_pct, 0.03)
-    vol20 = _safe(r.volatility20, 0.02)
-    bb_pos = _safe(r.bb_pos, 0.5)
-    close_loc = _safe(r.close_location, 0.5)
-    body_ratio = _safe(r.body_ratio, 0.5)
-    obv = _safe(r.obv, 0)
+    r, prev = x.iloc[-1], x.iloc[-2]
+    close = _safe(r.close); open_ = _safe(r.open, close)
+    ma5 = _safe(r.ma5, close); ma10 = _safe(r.ma10, close)
+    ma20 = _safe(r.ma20, close); ma60 = _safe(r.ma60, ma20)
+    volr = _safe(r.volume_ratio, 1); ret1 = _safe(r.ret1, 0)
+    ret3 = _safe(r.ret3, 0); ret5 = _safe(r.ret5, 0)
+    ret10 = _safe(r.ret10, 0); ret20 = _safe(r.ret20, 0)
+    rsi = _safe(r.rsi14, 50); dist20 = _safe(r.dist_ma20, 0)
+    macd_hist = _safe(r.macd_hist, 0); prev_macd_hist = _safe(prev.macd_hist, 0)
+    atr_pct = _safe(r.atr_pct, 0.03); vol20 = _safe(r.volatility20, 0.02)
+    bb_pos = _safe(r.bb_pos, 0.5); close_loc = _safe(r.close_location, 0.5)
+    body_ratio = _safe(r.body_ratio, 0.5); obv = _safe(r.obv, 0)
     obv_ma10 = _safe(r.obv_ma10, obv)
-    from20high = _safe(r.from_20_high, 0)
-    from20low = _safe(r.from_20_low, 0)
+    from20high = _safe(r.from_20_high, 0); from20low = _safe(r.from_20_low, 0)
+    recent_high = _safe(x["high"].iloc[-21:-1].max(), close)
 
     reasons = []
-
-    # 1) 趨勢 18
-    trend = 2.0
-    trend += 4 if close > ma20 else 0
-    trend += 3 if ma5 > ma10 else 0
-    trend += 3 if ma10 > ma20 else 0
-    trend += 3 if ma20 > ma60 else 0
-    trend += 2 if ret20 > 0 else 0
-    trend += 1 if ma20 > _safe(x["ma20"].iloc[-6], ma20) else 0
+    trend = 2.0 + (4 if close > ma20 else 0) + (3 if ma5 > ma10 else 0) + (3 if ma10 > ma20 else 0) + (3 if ma20 > ma60 else 0) + (2 if ret20 > 0 else 0) + (1 if ma20 > _safe(x["ma20"].iloc[-6], ma20) else 0)
     trend = _clamp(trend, 0, 18)
-    if trend >= 14: reasons.append("中期趨勢偏多")
-    elif trend <= 6: reasons.append("趨勢偏弱")
 
-    # 2) 量價 14
     volume_price = 4.0
     if 1.1 <= volr < 1.5: volume_price += 2
     elif 1.5 <= volr < 2.5: volume_price += 4
@@ -168,21 +134,10 @@ def stock_score(hist: pd.DataFrame) -> Dict[str, float | str]:
     if ret1 < -0.04 and volr >= 1.8: volume_price -= 2
     if obv > obv_ma10: volume_price += 1
     volume_price = _clamp(volume_price, 0, 14)
-    if volume_price >= 11: reasons.append("量價配合佳")
 
-    # 3) 動能 12
-    momentum = 4.0
-    if ret3 > 0: momentum += 1
-    if ret5 > 0: momentum += 2
-    if ret10 > 0: momentum += 1
-    if macd_hist > 0: momentum += 2
-    if macd_hist > prev_macd_hist: momentum += 1
-    if 45 <= rsi <= 68: momentum += 1
-    if rsi > 78: momentum -= 3
+    momentum = 4.0 + (1 if ret3 > 0 else 0) + (2 if ret5 > 0 else 0) + (1 if ret10 > 0 else 0) + (2 if macd_hist > 0 else 0) + (1 if macd_hist > prev_macd_hist else 0) + (1 if 45 <= rsi <= 68 else 0) - (3 if rsi > 78 else 0)
     momentum = _clamp(momentum, 0, 12)
-    if momentum >= 9: reasons.append("動能正在改善")
 
-    # 4) 位置 12
     position = 4.0
     if -0.035 <= dist20 <= 0.035: position += 4
     elif -0.07 <= dist20 < -0.035: position += 2
@@ -192,34 +147,15 @@ def stock_score(hist: pd.DataFrame) -> Dict[str, float | str]:
     if dist20 > 0.14 or bb_pos > 1.05: position -= 4
     if rsi > 80: position -= 2
     position = _clamp(position, 0, 12)
-    if position >= 9: reasons.append("價格位置尚佳")
-    elif position <= 4: reasons.append("價格位置不利")
 
-    # 5) 突破品質 12
-    recent_high = _safe(x["high"].iloc[-21:-1].max(), close)
-    breakout_quality = 2.0
-    if close > recent_high: breakout_quality += 4
-    if close >= recent_high * 0.985: breakout_quality += 2
-    if volr >= 1.4: breakout_quality += 2
-    if close_loc >= 0.70: breakout_quality += 1
-    if body_ratio >= 0.55 and close >= r.open: breakout_quality += 1
-    # 假突破風險
+    breakout_quality = 2.0 + (4 if close > recent_high else 0) + (2 if close >= recent_high * 0.985 else 0) + (2 if volr >= 1.4 else 0) + (1 if close_loc >= 0.70 else 0) + (1 if body_ratio >= 0.55 and close >= open_ else 0)
     if close > recent_high and close_loc < 0.45: breakout_quality -= 3
     breakout_quality = _clamp(breakout_quality, 0, 12)
-    if breakout_quality >= 9: reasons.append("突破品質佳")
 
-    # 6) 支撐 / 承接 10
-    support = 3.0
-    if close >= ma20 * 0.98: support += 2
-    if close >= ma10 * 0.985: support += 1
-    if close_loc >= 0.55: support += 1
-    if ret1 < 0 and close_loc >= 0.65: support += 2  # 下跌但收高
-    if from20low > 0.08: support += 1
+    support = 3.0 + (2 if close >= ma20 * 0.98 else 0) + (1 if close >= ma10 * 0.985 else 0) + (1 if close_loc >= 0.55 else 0) + (2 if ret1 < 0 and close_loc >= 0.65 else 0) + (1 if from20low > 0.08 else 0)
     if close < ma20 * 0.94: support -= 3
     support = _clamp(support, 0, 10)
-    if support >= 8: reasons.append("支撐承接明顯")
 
-    # 7) 波動/風險 10：分數越高代表風險越可控
     risk = 8.0
     if atr_pct > 0.06: risk -= 3
     elif atr_pct > 0.045: risk -= 1
@@ -228,9 +164,7 @@ def stock_score(hist: pd.DataFrame) -> Dict[str, float | str]:
     if dist20 > 0.15: risk -= 2
     if rsi > 82: risk -= 2
     risk = _clamp(risk, 0, 10)
-    if risk <= 5: reasons.append("短線波動風險偏高")
 
-    # 8) 穩定性 12：避免只因單日爆量/長紅就衝高分
     consistency = 4.0
     last10 = x["ret1"].iloc[-10:].dropna()
     if len(last10) >= 8:
@@ -244,59 +178,102 @@ def stock_score(hist: pd.DataFrame) -> Dict[str, float | str]:
     if abs(ret1) < 0.07: consistency += 1
     consistency = _clamp(consistency, 0, 12)
 
-    raw_score = trend + volume_price + momentum + position + breakout_quality + support + risk + consistency
+    trend_score = trend + volume_price + momentum + position + breakout_quality + support + risk + consistency
 
-    # 型態分類與額外懲罰
-    if ret1 <= -0.07 and volr >= 1.8 and close_loc >= 0.55:
-        setup = "事件型反彈"
-    elif close > recent_high and volr >= 1.35 and breakout_quality >= 8:
-        setup = "突破型"
+    # 事件型模型
+    last5_ret = x["ret1"].iloc[-5:].dropna()
+    last5_volr = x["volume_ratio"].iloc[-5:].dropna()
+    max_drop = abs(float(last5_ret.min())) if len(last5_ret) else 0
+    max_volr = float(last5_volr.max()) if len(last5_volr) else 1
+
+    shock = 0
+    if max_drop >= 0.09: shock += 12
+    elif max_drop >= 0.07: shock += 10
+    elif max_drop >= 0.05: shock += 7
+    elif max_drop >= 0.035: shock += 4
+    if max_volr >= 3: shock += 8
+    elif max_volr >= 2: shock += 6
+    elif max_volr >= 1.5: shock += 4
+    shock = _clamp(shock, 0, 20)
+
+    washout = 0
+    if close_loc >= 0.65: washout += 7
+    elif close_loc >= 0.5: washout += 4
+    if ret1 < 0 and close_loc >= 0.65: washout += 5
+    if max_drop >= 0.05 and ret1 > -0.03: washout += 4
+    if max_volr >= 1.8 and volr < max_volr * 0.7: washout += 4
+    washout = _clamp(washout, 0, 20)
+
+    stabilization = 0
+    if ret3 > -0.02: stabilization += 5
+    if ret5 > -0.06: stabilization += 4
+    if close >= ma5 * 0.98: stabilization += 4
+    if macd_hist > prev_macd_hist: stabilization += 3
+    if 30 <= rsi <= 60: stabilization += 2
+    if close_loc >= 0.55: stabilization += 2
+    stabilization = _clamp(stabilization, 0, 20)
+
+    rebound = 0
+    if ret1 > 0: rebound += 5
+    if ret3 > 0: rebound += 4
+    if close > ma5: rebound += 3
+    if close > ma10: rebound += 2
+    if volr >= 1.1 and ret1 > 0: rebound += 3
+    if obv > obv_ma10: rebound += 3
+    rebound = _clamp(rebound, 0, 20)
+
+    event_risk = 12
+    if ret1 < -0.07: event_risk -= 5
+    if close < ma20 * 0.9: event_risk -= 3
+    if atr_pct > 0.07: event_risk -= 3
+    if vol20 > 0.06: event_risk -= 2
+    if rsi < 20: event_risk -= 2
+    if ret3 > -0.03: event_risk += 3
+    if close_loc >= 0.55: event_risk += 2
+    event_risk = _clamp(event_risk, 0, 20)
+
+    event_score = shock + washout + stabilization + rebound + event_risk
+    event_active = ((max_drop >= 0.045 and max_volr >= 1.4) or (shock >= 12 and stabilization >= 10))
+
+    if close > recent_high and volr >= 1.35 and breakout_quality >= 8:
+        normal_setup = "突破型"
     elif close >= ma20 * 0.97 and close <= ma20 * 1.04 and volr <= 1.15 and ma20 >= ma60:
-        setup = "趨勢回檔"
+        normal_setup = "趨勢回檔"
     elif rsi >= 78 or dist20 >= 0.14:
-        setup = "過熱・不追"
-        raw_score -= 10
+        normal_setup = "過熱・不追"; trend_score -= 10
     elif close < ma20 * 0.96 and ret20 < 0:
-        setup = "弱勢觀察"
-        raw_score -= 8
+        normal_setup = "弱勢觀察"; trend_score -= 8
     else:
-        setup = "蓄勢/中性"
+        normal_setup = "蓄勢/中性"
 
-    # 資料完整度：未知不等於壞，但降低信心。
+    trend_score = _clamp(trend_score, 0, 100)
+    event_score = _clamp(event_score, 0, 100)
+
+    if event_active and event_score >= trend_score + 6:
+        score = event_score; score_mode = "事件型模型"; setup = "事件型機會"
+        reason = f"事件衝擊{shock:.0f}/20｜洗盤{washout:.0f}/20｜止穩{stabilization:.0f}/20｜反彈{rebound:.0f}/20"
+    else:
+        score = trend_score; score_mode = "趨勢型模型"; setup = normal_setup
+        reason = f"趨勢{trend:.0f}/18｜量價{volume_price:.0f}/14｜動能{momentum:.0f}/12｜突破{breakout_quality:.0f}/12"
+
     critical = [r.ma20, r.rsi14, r.volume_ratio, r.macd_hist, r.atr_pct, r.bb_pos]
     known = sum(0 if pd.isna(v) else 1 for v in critical)
     data_confidence = round(known / len(critical) * 100, 1)
 
-    # 極端單日訊號不能讓總分失真
-    if abs(ret1) >= 0.09 and volr >= 2.5:
-        raw_score -= 4
-        reasons.append("單日極端波動扣分")
-
-    score = _clamp(raw_score, 0, 100)
-
     return {
-        "score": round(score, 1),
-        "raw_score": round(raw_score, 1),
-        "setup": setup,
-        "trend": round(trend, 1),
-        "volume_price": round(volume_price, 1),
-        "momentum": round(momentum, 1),
-        "position": round(position, 1),
-        "breakout_quality": round(breakout_quality, 1),
-        "support": round(support, 1),
-        "risk": round(risk, 1),
-        "consistency": round(consistency, 1),
-        "data_confidence": data_confidence,
-        "score_reason": "；".join(reasons[:5]) if reasons else "條件中性",
-        "close": round(close, 4),
-        "ret1_pct": round(ret1 * 100, 4),
-        "ret5_pct": round(ret5 * 100, 4),
-        "ret20_pct": round(ret20 * 100, 4),
-        "volume_ratio": round(volr, 3),
-        "rsi14": round(rsi, 1),
-        "ma20": round(ma20, 4),
-        "atr_pct": round(atr_pct * 100, 3),
-        "macd_hist": round(macd_hist, 4),
+        "score":round(score,1), "trend_score":round(trend_score,1), "event_score":round(event_score,1),
+        "score_mode":score_mode, "setup":setup, "trend":round(trend,1),
+        "volume_price":round(volume_price,1), "momentum":round(momentum,1), "position":round(position,1),
+        "breakout_quality":round(breakout_quality,1), "support":round(support,1),
+        "risk":round(risk,1), "consistency":round(consistency,1),
+        "event_shock":round(shock,1), "event_washout":round(washout,1),
+        "event_stabilization":round(stabilization,1), "event_rebound":round(rebound,1),
+        "event_risk":round(event_risk,1), "event_active":bool(event_active),
+        "data_confidence":data_confidence, "score_reason":reason,
+        "close":round(close,4), "ret1_pct":round(ret1*100,4), "ret5_pct":round(ret5*100,4),
+        "ret20_pct":round(ret20*100,4), "volume_ratio":round(volr,3),
+        "rsi14":round(rsi,1), "ma20":round(ma20,4), "atr_pct":round(atr_pct*100,3),
+        "macd_hist":round(macd_hist,4),
     }
 
 

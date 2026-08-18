@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.8",
+  "version": "6.9",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -76,5 +76,14 @@
   },
   "candidate_persistence": true,
   "candidate_persistence_prior_score": 70,
-  "candidate_persistence_decay": 0.88
+  "candidate_persistence_decay": 0.88,
+  "dual_track_scoring": true,
+  "event_tracking_days": 5,
+  "event_model": {
+    "shock": 20,
+    "washout": 20,
+    "stabilization": 20,
+    "rebound": 20,
+    "risk": 20
+  }
 }

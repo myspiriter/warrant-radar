@@ -35,15 +35,19 @@ def zh_stock_table(df: pd.DataFrame) -> pd.DataFrame:
     if "code" in x.columns:
         x["股票"] = x["code"].astype(str).map(stock_label)
     x = x.rename(columns={
-        "score":"機會分數", "setup":"訊號類型", "close":"前收/日線收盤價", "data_confidence":"資料信心(%)", "score_reason":"評分重點", "candidate_status":"候選狀態",
+        "score":"機會分數", "trend_score":"趨勢分數", "event_score":"事件分數", "score_mode":"評分模型", "setup":"訊號類型", "close":"前收/日線收盤價", "data_confidence":"資料信心(%)", "score_reason":"評分重點", "candidate_status":"候選狀態",
         "ret1_pct":"日線漲跌幅(%)", "ret5_pct":"近5日漲跌幅(%)",
         "volume_ratio":"日線量比", "rsi14":"RSI強弱指標", "ma20":"20日均線", "breakout_quality":"突破品質", "support":"支撐承接", "risk":"風險控制", "consistency":"穩定性",
         "last":"盤中成交價", "bid":"盤中委買", "ask":"盤中委賣",
         "change_pct_live":"盤中漲跌幅(%)", "volume_live":"盤中累計量",
         "quote_time":"行情時間"
     })
-    cols=[c for c in ["股票","機會分數","候選等級","候選狀態","資料信心(%)","盤中判斷","訊號類型","評分重點","盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間","前收/日線收盤價","日線漲跌幅(%)","近5日漲跌幅(%)","日線量比","RSI強弱指標","突破品質","支撐承接","風險控制","穩定性","20日均線"] if c in x.columns]
-    return x[cols]
+    cols=[c for c in ["股票","機會分數","趨勢分數","事件分數","評分模型","候選等級","候選狀態","資料信心(%)","盤中判斷","訊號類型","評分重點","盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間","前收/日線收盤價","日線漲跌幅(%)","近5日漲跌幅(%)","日線量比","RSI強弱指標","突破品質","支撐承接","風險控制","穩定性","20日均線"] if c in x.columns]
+    out = x[cols].copy()
+    for _c in out.columns:
+        if _c != "機會分數":
+            out[_c] = out[_c].where(pd.notna(out[_c]), "—")
+    return out
 
 def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
     x = df.copy()
@@ -164,7 +168,8 @@ def load_cfg():
     return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
 
 
-LAST_RANKING_PATH = Path("/tmp/warrant_radar_last_ranking.csv")
+LAST_RANKING_PATH = APP_DIR / "last_ranking.csv"
+EVENT_TRACK_PATH = APP_DIR / "event_tracking.csv"
 
 def load_last_ranking():
     try:
@@ -180,6 +185,78 @@ def save_last_ranking(df):
             df.to_csv(LAST_RANKING_PATH, index=False, encoding="utf-8-sig")
     except Exception:
         pass
+
+
+def load_event_tracking():
+    try:
+        if EVENT_TRACK_PATH.exists():
+            return pd.read_csv(EVENT_TRACK_PATH, dtype={"code":str})
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def update_event_tracking(ranking: pd.DataFrame, keep_days=5):
+    today = pd.Timestamp.today().normalize()
+    old = load_event_tracking()
+
+    fresh = pd.DataFrame()
+    if ranking is not None and not ranking.empty:
+        mode = ranking["score_mode"] if "score_mode" in ranking.columns else pd.Series("", index=ranking.index)
+        setup = ranking["setup"] if "setup" in ranking.columns else pd.Series("", index=ranking.index)
+        mask = mode.eq("事件型模型") | setup.isin(["事件型機會","事件型反彈"])
+        fresh = ranking[mask].copy()
+        if not fresh.empty:
+            fresh["event_last_seen"] = today.strftime("%Y-%m-%d")
+
+    if old is not None and not old.empty and "event_last_seen" in old.columns:
+        old["event_last_seen"] = pd.to_datetime(old["event_last_seen"], errors="coerce")
+        old = old[(today - old["event_last_seen"]).dt.days <= keep_days].copy()
+        old["event_last_seen"] = old["event_last_seen"].dt.strftime("%Y-%m-%d")
+
+    combined = pd.concat([old, fresh], ignore_index=True, sort=False) if old is not None and not old.empty else fresh
+    if combined is None or combined.empty:
+        return pd.DataFrame()
+
+    combined["code"] = combined["code"].astype(str)
+    combined = combined.sort_values("event_last_seen").drop_duplicates("code", keep="last")
+    try:
+        combined.to_csv(EVENT_TRACK_PATH, index=False, encoding="utf-8-sig")
+    except Exception:
+        pass
+    return combined
+
+def merge_event_tracking(ranking: pd.DataFrame, event_track: pd.DataFrame, keep_days=5):
+    if event_track is None or event_track.empty:
+        return ranking
+    if ranking is None:
+        ranking = pd.DataFrame()
+
+    cur_codes = set(ranking["code"].astype(str)) if (not ranking.empty and "code" in ranking.columns) else set()
+    missing = event_track[~event_track["code"].astype(str).isin(cur_codes)].copy()
+    if missing.empty:
+        return ranking
+
+    today = pd.Timestamp.today().normalize()
+    seen = pd.to_datetime(missing["event_last_seen"], errors="coerce")
+    age = (today - seen).dt.days.fillna(keep_days)
+
+    original = pd.to_numeric(missing["score"], errors="coerce").fillna(0)
+    decay = (1 - 0.04 * age.clip(lower=1, upper=keep_days))
+    missing["last_score"] = original
+    missing["score"] = (original * decay).clip(upper=69).round(1)
+    missing["candidate_status"] = "事件追蹤保留"
+    missing["setup"] = "事件追蹤"
+    missing["score_mode"] = "事件追蹤"
+    missing["score_reason"] = "事件型高分股持續追蹤；本次未進候選池，等待最新資料重新確認"
+    missing["data_confidence"] = 50.0
+
+    if ranking.empty:
+        out = missing
+    else:
+        out = pd.concat([ranking, missing], ignore_index=True, sort=False)
+
+    out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0)
+    return out.sort_values("score", ascending=False).reset_index(drop=True)
 
 def preserve_missing_high_score(current: pd.DataFrame, previous: pd.DataFrame,
                                 prior_threshold=70, max_keep=10):
@@ -300,7 +377,7 @@ def build_dynamic_pool(all_stocks: pd.DataFrame, wb: pd.DataFrame, wv: pd.DataFr
 def dynamic_ranking(pool: pd.DataFrame):
     base_cols = [
         "code","name","活躍權證數","現股成交量(張)","現股成交金額",
-        "score","raw_score","setup","close","ret1_pct","ret5_pct","ret20_pct",
+        "score","trend_score","event_score","score_mode","setup","close","ret1_pct","ret5_pct","ret20_pct",
         "volume_ratio","rsi14","ma20","breakout_quality","support","risk","consistency",
         "data_confidence","score_reason"
     ]
@@ -534,7 +611,7 @@ def diagnose_stock(code, all_stocks, ranking, pool, warrants_df,
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.8")
+st.title("📡 個人版台股權證雷達 V6.9")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -677,6 +754,8 @@ else:
 # V6.8：前次高分候選若因本次資料/預篩問題消失，保留為「資料待確認」
 if scan_mode:
     ranking = preserve_missing_high_score(ranking, previous_ranking, prior_threshold=70, max_keep=10)
+    _event_track = update_event_tracking(ranking, keep_days=5)
+    ranking = merge_event_tracking(ranking, _event_track, keep_days=5)
 
 save_last_ranking(ranking)
 
@@ -750,6 +829,9 @@ required_ranking_cols = {
     "consistency": pd.NA,
     "data_confidence": pd.NA,
     "score_reason": "",
+    "trend_score": pd.NA,
+    "event_score": pd.NA,
+    "score_mode": "",
     "candidate_status": "本次正常",
     "last_score": pd.NA,
 }
@@ -764,6 +846,8 @@ ranking["候選等級"] = ranking["score"].map(candidate_grade)
 if "candidate_status" in ranking.columns:
     _preserved = ranking["candidate_status"].eq("前次高分保留")
     ranking.loc[_preserved, "候選等級"] = "🟠 前次高分／待確認"
+    _evt_saved = ranking["candidate_status"].eq("事件追蹤保留")
+    ranking.loc[_evt_saved, "候選等級"] = "🔥 事件追蹤"
 
 # V6.7 盤中行情覆蓋
 # 不再只抓 ranking 前 N 名；改成：
@@ -828,15 +912,15 @@ c2.metric("80分以上強力候選", int((pd.to_numeric(valid["score"], errors="
 c3.metric("事件型反彈", int((valid["setup"] == "事件型反彈").sum()))
 c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破型"]).sum()))
 
-TAB_TODAY, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
-    ["🔥 今日推薦","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
+TAB_TODAY, TAB_EVENT, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
+    ["🔥 今日推薦","⚡ 事件型機會","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
 
 with TAB_TODAY:
     st.subheader("今日推薦")
     recommended = ranking[
         (pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 70) &
         (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"])) &
-        (~ranking["candidate_status"].eq("前次高分保留"))
+        (~ranking["candidate_status"].isin(["前次高分保留","事件追蹤保留"]))
     ].copy()
 
     if recommended.empty:
@@ -887,6 +971,34 @@ with TAB_TODAY:
                 st.dataframe(zh_warrant_table(wr[[c for c in cols if c in wr.columns]].head(5)), width="stretch", hide_index=True)
         else:
             st.warning("目前沒有完整權證條款資料。請在左側上傳券商匯出的權證 CSV，就能直接算出『最佳券商＋最佳權證』。TWSE 每日成交量資料已可自動抓取。")
+
+with TAB_EVENT:
+    st.subheader("⚡ 事件型機會")
+    st.caption("專門追蹤爆量急跌、恐慌洗盤、事件衝擊後止穩反彈型股票。")
+    _evt = ranking[
+        ranking["score_mode"].isin(["事件型模型","事件追蹤"]) |
+        ranking["setup"].isin(["事件型機會","事件型反彈","事件追蹤"])
+    ].copy()
+
+    if _evt.empty:
+        st.info("目前沒有事件型候選。")
+    else:
+        _evt = _evt.sort_values(["event_score","score"], ascending=False, na_position="last").head(10)
+        st.dataframe(zh_stock_table(_evt), width="stretch", hide_index=True)
+
+        _ecodes = _evt["code"].astype(str).tolist()
+        _chosen_evt = st.selectbox("查看事件型個股", _ecodes, format_func=stock_label, key="event_stock")
+        _er = _evt[_evt["code"].astype(str) == str(_chosen_evt)].iloc[0]
+
+        c1,c2,c3,c4 = st.columns(4)
+        def _fmt(v):
+            vv = pd.to_numeric(v, errors="coerce")
+            return float(vv) if pd.notna(vv) else 0.0
+        c1.metric("最終分數", f"{_fmt(_er.get('score')):.1f}")
+        c2.metric("事件分數", f"{_fmt(_er.get('event_score')):.1f}")
+        c3.metric("趨勢分數", f"{_fmt(_er.get('trend_score')):.1f}")
+        c4.metric("資料信心", f"{_fmt(_er.get('data_confidence')):.0f}%")
+        st.info(f"評分重點：{_er.get('score_reason','—')}")
 
 with TAB_YDAY:
     st.subheader("昨日訊號追蹤")
@@ -1068,6 +1180,14 @@ with TAB_WARRANT:
                     )
 
 with TAB_SETTINGS:
+    st.markdown("""
+### V6.9 雙軌模型
+每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
+爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
+
+事件型模型包含：事件衝擊、洗盤品質、止穩、反彈確認、事件風險五部分，共100分。
+事件型高分股會持續追蹤約5天，不會因一次刷新或預篩資料缺失直接消失。
+""")
     st.markdown("""
 ### V6.8 評分架構
 現股機會分數改為八大因子，共100分：  
