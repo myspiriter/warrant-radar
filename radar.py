@@ -277,6 +277,250 @@ def stock_score(hist: pd.DataFrame) -> Dict[str, float | str]:
     }
 
 
+def moneyness_pct(underlying_price: float, strike: float, warrant_type: str = "CALL") -> float:
+    if not underlying_price or not strike:
+        return np.nan
+    t = str(warrant_type).upper()
+    if "PUT" in t or "售" in t:
+        return (underlying_price - strike) / strike * 100  # positive means OTM for put
+    return (strike - underlying_price) / underlying_price * 100  # positive means OTM for call
+
+def warrant_score(row: pd.Series, underlying_price: float, cfg: Dict) -> Dict[str, float | str | bool]:
+    volume = float(row.get("volume", 0) or 0)
+    expiry = pd.to_datetime(row.get("expiry"), errors="coerce")
+    today = pd.Timestamp.today().normalize()
+    dte = (expiry.normalize() - today).days if not pd.isna(expiry) else np.nan
+    strike = pd.to_numeric(row.get("strike"), errors="coerce")
+    wtype = str(row.get("warrant_type", "CALL")).upper()
+    otm = moneyness_pct(underlying_price, strike, wtype) if not pd.isna(strike) else np.nan
+    delta = pd.to_numeric(row.get("delta"), errors="coerce")
+    eff = pd.to_numeric(row.get("effective_leverage"), errors="coerce")
+    bid = pd.to_numeric(row.get("bid"), errors="coerce")
+    ask = pd.to_numeric(row.get("ask"), errors="coerce")
+    iv = pd.to_numeric(row.get("iv"), errors="coerce")
+    price = pd.to_numeric(row.get("price"), errors="coerce")
+
+    hard_ok = True
+    reasons = []
+    if volume < cfg["min_warrant_volume"]:
+        hard_ok = False; reasons.append("成交量不足")
+    if not pd.isna(dte) and dte < cfg["min_days_to_expiry"]:
+        hard_ok = False; reasons.append("剩餘天數不足")
+    if not pd.isna(otm) and otm > cfg["max_otm_pct"]:
+        hard_ok = False; reasons.append("價外過深")
+
+    if volume >= 1000: vol_s = 20
+    elif volume >= 500: vol_s = 18
+    elif volume >= 300: vol_s = 15
+    elif volume >= 100: vol_s = 8
+    else: vol_s = 2
+
+    if pd.isna(dte): dte_s = 7
+    elif dte >= 180: dte_s = 15
+    elif dte >= 150: dte_s = 14
+    elif dte >= 120: dte_s = 12
+    elif dte >= 90: dte_s = 7
+    else: dte_s = 2
+
+    if pd.isna(otm): money_s = 8
+    elif -5 <= otm <= 5: money_s = 20
+    elif 5 < otm <= 10: money_s = 18
+    elif 10 < otm <= 15: money_s = 13
+    elif -15 <= otm < -5: money_s = 17
+    elif otm > 20: money_s = 2
+    else: money_s = 8
+
+    if pd.isna(delta): delta_s = 7
+    elif cfg["preferred_delta_min"] <= abs(delta) <= cfg["preferred_delta_max"]: delta_s = 15
+    elif 0.25 <= abs(delta) <= 0.75: delta_s = 10
+    else: delta_s = 4
+
+    if pd.isna(eff): lev_s = 5
+    elif cfg["preferred_effective_leverage_min"] <= eff <= cfg["preferred_effective_leverage_max"]: lev_s = 10
+    elif 2 <= eff <= 8: lev_s = 7
+    else: lev_s = 3
+
+    spread_pct = np.nan
+    if not pd.isna(bid) and not pd.isna(ask) and ask > 0:
+        mid = (bid + ask) / 2
+        spread_pct = (ask - bid) / mid * 100 if mid > 0 else np.nan
+    if pd.isna(spread_pct): spread_s = 5
+    elif spread_pct <= 2: spread_s = 10
+    elif spread_pct <= 4: spread_s = 8
+    elif spread_pct <= 7: spread_s = 5
+    else: spread_s = 1
+
+    if pd.isna(iv): iv_s = 5
+    elif iv <= 45: iv_s = 10
+    elif iv <= 65: iv_s = 8
+    elif iv <= 85: iv_s = 5
+    else: iv_s = 2
+
+    total = vol_s + dte_s + money_s + delta_s + lev_s + spread_s + iv_s
+    if not hard_ok:
+        total = min(total, 59)
+    return {
+        "warrant_score": round(total, 1), "eligible": hard_ok,
+        "days_to_expiry": None if pd.isna(dte) else int(dte),
+        "otm_pct": None if pd.isna(otm) else round(float(otm), 2),
+        "spread_pct": None if pd.isna(spread_pct) else round(float(spread_pct), 2),
+        "filter_reason": "、".join(reasons) if reasons else "通過",
+    }
+
+def normalize_warrant_columns(df: pd.DataFrame) -> pd.DataFrame:
+    aliases = {
+        "warrant_code": ["warrant_code", "權證代號", "代號", "證券代號"],
+        "warrant_name": ["warrant_name", "權證名稱", "名稱", "證券名稱"],
+        "underlying": ["underlying", "標的代號", "標的證券代號", "標的"],
+        "issuer": ["issuer", "發行券商", "發行商", "發行人", "發行證券商名稱", "券商"],
+        "warrant_type": ["warrant_type", "類型", "權證類型", "認購售", "認購（售）別"],
+        "price": ["price", "成交價", "收盤價", "最後成交價", "權證價格"],
+        "volume": ["volume", "成交量", "成交數量", "成交量(張)"],
+        "strike": ["strike", "履約價", "履約價格", "最新履約價格"],
+        "expiry": ["expiry", "到期日", "到期日期", "權證到期日", "最後交易日"],
+        "bid": ["bid", "委買", "最佳買價"],
+        "ask": ["ask", "委賣", "最佳賣價"],
+        "delta": ["delta", "Delta", "DELTA"],
+        "iv": ["iv", "IV", "隱含波動率"],
+        "effective_leverage": ["effective_leverage", "有效槓桿", "實質槓桿"],
+    }
+    ren = {}
+    for target, candidates in aliases.items():
+        for c in candidates:
+            if c in df.columns:
+                ren[c] = target
+                break
+    x = df.rename(columns=ren).copy()
+    for c in aliases:
+        if c not in x.columns:
+            x[c] = np.nan
+
+    x["warrant_code"] = x["warrant_code"].astype(str).str.strip()
+    x["warrant_name"] = x["warrant_name"].fillna("").astype(str).str.strip()
+    x["underlying"] = x["underlying"].astype(str).str.extract(
+        r"(\d{4,6})", expand=False
+    ).fillna(x["underlying"].astype(str))
+
+    for c in ["price","volume","strike","bid","ask","delta","iv","effective_leverage"]:
+        x[c] = pd.to_numeric(
+            x[c].astype(str).str.replace(",", "", regex=False).str.replace("%", "", regex=False),
+            errors="coerce"
+        )
+
+    x["expiry"] = pd.to_datetime(x["expiry"], errors="coerce")
+    x["warrant_type"] = x["warrant_type"].fillna("CALL").astype(str).apply(
+        lambda v: "PUT" if ("售" in v or "PUT" in v.upper()) else "CALL"
+    )
+
+    issuers = ["元大","凱基","群益","永豐","富邦","元富","統一","國票","兆豐","中信",
+               "玉山","第一金","華南永昌","康和","國泰","台新","合庫","宏遠","亞東"]
+    def infer_issuer(row):
+        current = str(row.get("issuer") or "").strip()
+        if current and current.lower() not in ("nan","none","<na>"):
+            return current
+        name = str(row.get("warrant_name") or "")
+        for i in issuers:
+            if i in name:
+                return i
+        return ""
+    x["issuer"] = x.apply(infer_issuer, axis=1)
+    return x
+
+def rank_warrants(df: pd.DataFrame, underlying: str, spot: float, cfg: dict) -> pd.DataFrame:
+    x = normalize_warrant_columns(df)
+    underlying = str(underlying)
+    x = x[x["underlying"].astype(str) == underlying].copy()
+    if x.empty:
+        return x
+
+    # 認購為主
+    x = x[x["warrant_type"].fillna("CALL").eq("CALL")].copy()
+    if x.empty:
+        return x
+
+    today = pd.Timestamp.today().normalize()
+    x["expiry"] = pd.to_datetime(x["expiry"], errors="coerce")
+    x["days_to_expiry"] = (x["expiry"] - today).dt.days
+
+    x["strike"] = pd.to_numeric(x["strike"], errors="coerce")
+    if spot and spot > 0:
+        x["otm_pct"] = (x["strike"] / float(spot) - 1.0) * 100.0
+    else:
+        x["otm_pct"] = np.nan
+
+    x["price"] = pd.to_numeric(x["price"], errors="coerce")
+    x["volume"] = pd.to_numeric(x["volume"], errors="coerce").fillna(0)
+    x["bid"] = pd.to_numeric(x["bid"], errors="coerce")
+    x["ask"] = pd.to_numeric(x["ask"], errors="coerce")
+    x["delta"] = pd.to_numeric(x["delta"], errors="coerce")
+    x["iv"] = pd.to_numeric(x["iv"], errors="coerce")
+    x["effective_leverage"] = pd.to_numeric(x["effective_leverage"], errors="coerce")
+
+    # 買賣價差
+    mid = (x["bid"] + x["ask"]) / 2
+    x["spread_pct"] = np.where(
+        (x["bid"].notna()) & (x["ask"].notna()) & (mid > 0),
+        (x["ask"] - x["bid"]) / mid * 100,
+        np.nan
+    )
+
+    min_vol = float(cfg.get("min_warrant_volume", 300))
+    min_dte = float(cfg.get("min_days_to_expiry", 120))
+    max_otm = float(cfg.get("max_otm_pct", 15.0))
+
+    # 分數：公開資料可得欄位優先，缺資料不直接判死刑
+    vol_score = np.clip(np.log10(x["volume"].fillna(0) + 1) / 5 * 35, 0, 35)
+
+    dte_score = pd.Series(8.0, index=x.index)
+    dte_known = x["days_to_expiry"].notna()
+    dte_score.loc[dte_known] = np.clip((x.loc[dte_known, "days_to_expiry"] / max(min_dte,1)) * 15, 0, 15)
+
+    otm_score = pd.Series(8.0, index=x.index)
+    otm_known = x["otm_pct"].notna()
+    otm_abs = x.loc[otm_known, "otm_pct"].abs()
+    otm_score.loc[otm_known] = np.clip(20 - (otm_abs / max(max_otm,1) * 20), 0, 20)
+
+    spread_score = pd.Series(8.0, index=x.index)
+    spread_known = x["spread_pct"].notna()
+    spread_score.loc[spread_known] = np.clip(15 - x.loc[spread_known, "spread_pct"] * 1.2, 0, 15)
+
+    price_score = pd.Series(5.0, index=x.index)
+    price_known = x["price"].notna() & (x["price"] > 0)
+    price_score.loc[price_known] = 10.0
+
+    issuer_score = x["issuer"].fillna("").astype(str).str.len().gt(0).astype(float) * 5
+
+    x["warrant_score"] = (
+        vol_score + dte_score + otm_score + spread_score + price_score + issuer_score
+    ).round(1)
+
+    # 硬條件只對「已知」欄位判斷；未知欄位不因資料缺失直接淘汰。
+    eligible = x["volume"] >= min_vol
+    reasons = pd.Series("", index=x.index, dtype=object)
+
+    fail_vol = x["volume"] < min_vol
+    reasons.loc[fail_vol] += "成交量不足；"
+
+    fail_dte = x["days_to_expiry"].notna() & (x["days_to_expiry"] < min_dte)
+    eligible = eligible & ~fail_dte
+    reasons.loc[fail_dte] += "剩餘天數不足；"
+
+    fail_otm = x["otm_pct"].notna() & (x["otm_pct"] > max_otm)
+    eligible = eligible & ~fail_otm
+    reasons.loc[fail_otm] += "價外過深；"
+
+    x["eligible"] = eligible
+    x["filter_reason"] = np.where(
+        x["eligible"],
+        "通過目前可驗證條件",
+        reasons.str.rstrip("；")
+    )
+
+    return x.sort_values(
+        ["eligible","warrant_score","volume"],
+        ascending=[False,False,False]
+    ).reset_index(drop=True)
+
 def entry_plan(stock_row: Dict, first_amount: float, reserve_amount: float) -> Dict[str, str | float]:
     """Create an entry plan using user-editable first-entry and reserve amounts.
 
@@ -296,7 +540,7 @@ def entry_plan(stock_row: Dict, first_amount: float, reserve_amount: float) -> D
             "add_rule": "首筆投入＋預備金合計不得超過 NT$500,000。",
             "stop_rule": "調整完成後才建立交易計畫。"
         }
-    if setup == "事件型反彈":
+    if setup in ["事件型反彈","事件型機會","事件追蹤"]:
         return {
             "first": first, "reserve": reserve,
             "instruction": f"首筆 {first:,.0f}；預備 {reserve:,.0f}，不因單純下跌一次補滿。",
