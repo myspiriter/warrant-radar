@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.10",
+  "version": "6.12",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -94,5 +94,7 @@
     "strong": "80+"
   },
   "event_pool_requires_warrants": false,
-  "event_pool_max_candidates": 120
+  "event_pool_max_candidates": 120,
+  "event_reason_column": true,
+  "daily_market_summary": true
 }

@@ -626,7 +626,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.11 獨立事件池：
+    """V6.12 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -701,7 +701,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
     out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
 
-    # V6.11：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    # V6.12：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
     out["事件等級"] = out["event_score"].map(event_grade)
     out = out[out["event_score"] >= 60].copy()
 
@@ -711,8 +711,47 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     ).reset_index(drop=True)
 
 
+
+def event_reason_text(row):
+    def n(k):
+        v = pd.to_numeric(row.get(k), errors="coerce")
+        return float(v) if pd.notna(v) else 0.0
+    shock,wash,stab,rebound,risk = [n(k) for k in ["event_shock","event_washout","event_stabilization","event_rebound","event_risk"]]
+    ret1,volr = n("ret1_pct"),n("volume_ratio")
+    reasons=[]
+    if shock>=14: reasons.append("近期出現明顯爆量/急跌事件")
+    elif shock>=8: reasons.append("近期價格與成交量出現異常波動")
+    if wash>=13: reasons.append("恐慌賣壓後出現承接/洗盤跡象")
+    if stab>=13: reasons.append("短線跌勢開始止穩")
+    if rebound>=13: reasons.append("反彈動能已出現確認")
+    if risk>=14: reasons.append("事件風險已有收斂")
+    elif risk<=8: reasons.append("但目前波動風險仍偏高")
+    if ret1>0 and volr>=1.1: reasons.append("今日上漲且量能配合")
+    return "；".join((reasons or ["事件模型綜合分數達觀察門檻"])[:4])
+
+def market_summary_text(ranking, event_ranking):
+    ranking = pd.DataFrame() if ranking is None else ranking
+    event_ranking = pd.DataFrame() if event_ranking is None else event_ranking
+    scores = pd.to_numeric(ranking.get("score", pd.Series(dtype=float)), errors="coerce").dropna()
+    es = pd.to_numeric(event_ranking.get("event_score", pd.Series(dtype=float)), errors="coerce").dropna()
+    strong=int((scores>=80).sum()) if len(scores) else 0
+    good=int(((scores>=70)&(scores<80)).sum()) if len(scores) else 0
+    avg=float(scores.mean()) if len(scores) else 0
+    en=int((es>=60).sum()) if len(es) else 0
+    estrong=int((es>=80).sum()) if len(es) else 0
+    if strong>=3 and avg>=72:
+        tone="偏多且機會擴散"; action="可優先從高分股尋找量價確認後的進場點，但避免追高。"
+    elif strong>=1 or good>=3:
+        tone="偏多但屬選股行情"; action="強弱分化，宜集中高分且有籌碼或事件確認的標的。"
+    elif en>=3:
+        tone="震盪、事件型機會較多"; action="宜等待事件股止穩與反彈確認，不宜全面追價。"
+    else:
+        tone="中性偏保守"; action="高品質訊號不多，建議提高進場門檻並控制部位。"
+    return f"今日雷達判斷：**{tone}**。一般候選 {len(ranking)} 檔，80分以上 {strong} 檔、70–79分 {good} 檔，平均 {avg:.1f} 分。事件雷達 {en} 檔達60分，其中 {estrong} 檔達80分以上。{action}"
+
+
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.11")
+st.title("📡 個人版台股權證雷達 V6.12")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -860,7 +899,7 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.11：獨立事件掃描，不經過權證活躍度預篩
+# V6.12：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
@@ -987,7 +1026,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.11 事件雷達前10名
+    # V6.12 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1027,6 +1066,9 @@ c2.metric("80分以上強力候選", int((pd.to_numeric(valid["score"], errors="
 _event80 = int((pd.to_numeric(event_ranking["event_score"], errors="coerce").fillna(0) >= 80).sum()) if event_ranking is not None and not event_ranking.empty else 0
 c3.metric("80分以上事件機會", _event80)
 c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破型"]).sum()))
+
+st.markdown("### 🧭 今日市場分析")
+st.info(market_summary_text(ranking, event_ranking))
 
 TAB_TODAY, TAB_EVENT, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
     ["🔥 今日推薦","⚡ 事件型機會","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
@@ -1091,7 +1133,7 @@ with TAB_TODAY:
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.11 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.12 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1143,6 +1185,7 @@ with TAB_EVENT:
             "止穩": _evt.get("event_stabilization", pd.NA),
             "反彈確認": _evt.get("event_rebound", pd.NA),
             "事件風險": _evt.get("event_risk", pd.NA),
+            "事件型原因": _evt.apply(event_reason_text, axis=1),
             "評分重點": _evt.get("score_reason", "—"),
         })
 
@@ -1180,6 +1223,7 @@ with TAB_EVENT:
         c3.metric("事件等級", event_grade(_num0(_er.get("event_score"))))
         c4.metric("資料信心", f"{_num0(_er.get('data_confidence')):.0f}%")
 
+        st.success(f"**為什麼是事件型機會：** {event_reason_text(_er)}")
         st.info(f"評分重點：{_er.get('score_reason','—')}")
 
         d1,d2,d3,d4,d5 = st.columns(5)
@@ -1370,7 +1414,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.11 雙軌＋獨立事件雷達
+### V6.12 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -1413,8 +1457,8 @@ with TAB_SETTINGS:
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
 
 
-# ===== V6.11 籌碼評分說明 =====
-with st.expander("🏦 V6.11 法人／大戶籌碼評分", expanded=False):
+# ===== V6.12 籌碼評分說明 =====
+with st.expander("🏦 V6.12 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
