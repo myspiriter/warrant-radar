@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.16.1",
+  "version": "6.16.2",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -123,5 +123,7 @@
     "median"
   ],
   "import_guard": true,
-  "overheat_local_fallback": true
+  "overheat_local_fallback": true,
+  "validation_missing_column_guard": true,
+  "validation_partial_history_supported": true
 }

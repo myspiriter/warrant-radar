@@ -13,7 +13,7 @@ import streamlit as st
 from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 
-# V6.16.1：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
+# V6.16.2：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
 try:
     from radar import overheat_score_v614
 except ImportError:
@@ -760,7 +760,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.16.1 獨立事件池：
+    """V6.16.2 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -835,7 +835,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
     out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
 
-    # V6.16.1：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    # V6.16.2：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
     out["事件等級"] = out["event_score"].map(event_grade)
     out = out[out["event_score"] >= 60].copy()
 
@@ -1099,8 +1099,8 @@ def validation_summary(df, horizon_col):
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.16.1")
-st.caption("V6.16.1｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
+st.title("📡 個人版台股權證雷達 V6.16.2")
+st.caption("V6.16.2｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -1248,7 +1248,7 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.16.1：獨立事件掃描，不經過權證活躍度預篩
+# V6.16.2：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
@@ -1378,7 +1378,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.16.1 事件雷達前10名
+    # V6.16.2 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1422,7 +1422,7 @@ c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破
 st.markdown("### 🧭 今日市場分析")
 st.info(market_summary_text(ranking, event_ranking))
 
-# V6.16.1 每日推薦驗證快照
+# V6.16.2 每日推薦驗證快照
 _previous_recs, _previous_rec_date = load_previous_recommendation_snapshot()
 save_recommendation_snapshot(ranking)
 
@@ -1489,7 +1489,7 @@ with TAB_TODAY:
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.16.1 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.16.2 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1526,7 +1526,7 @@ with TAB_EVENT:
             axis=1
         )
 
-        # V6.16.1 籌碼事件辨識
+        # V6.16.2 籌碼事件辨識
         _chip_events = _evt["code"].astype(str).map(chip_event_for_code)
         _evt["籌碼事件"] = _chip_events.map(lambda d: d.get("籌碼事件","⚪ 無法確認"))
         _evt["籌碼判斷信心"] = _chip_events.map(lambda d: d.get("判斷信心",0))
@@ -1614,7 +1614,7 @@ with TAB_EVENT:
 
 with TAB_VALIDATE:
     st.subheader("📊 推薦績效驗證｜1日・3日・5日")
-    st.caption("從 V6.15 起保存每日推薦快照；V6.16.1 會用後續交易日實際價格驗證 1/3/5 日表現。")
+    st.caption("從 V6.15 起保存每日推薦快照；V6.16.2 會用後續交易日實際價格驗證 1/3/5 日表現。")
 
     try:
         _vhist = pd.read_csv(VALIDATION_HISTORY_PATH, dtype={"code":str}) if VALIDATION_HISTORY_PATH.exists() else pd.DataFrame()
@@ -1627,7 +1627,7 @@ with TAB_VALIDATE:
         _mv = build_multiday_validation(_vhist)
 
         if _mv.empty:
-            st.info("推薦歷史目前尚無法完成多日驗證。")
+            st.info("推薦歷史目前尚無法完成多日驗證；系統會隨交易日累積自動補齊1日、3日、5日結果。")
         else:
             # 最新推薦批次優先顯示
             _mv["snapshot_date"] = _mv["snapshot_date"].astype(str)
@@ -1641,11 +1641,11 @@ with TAB_VALIDATE:
                 "推薦分數": pd.to_numeric(_latest.get("score"), errors="coerce"),
                 "推薦訊號": _latest.get("setup","—"),
                 "基準價": pd.to_numeric(_latest.get("close"), errors="coerce"),
-                "1日報酬(%)": pd.to_numeric(_latest.get("1日報酬(%)"), errors="coerce"),
-                "3日報酬(%)": pd.to_numeric(_latest.get("3日報酬(%)"), errors="coerce"),
-                "5日報酬(%)": pd.to_numeric(_latest.get("5日報酬(%)"), errors="coerce"),
-                "5日內最高漲幅(%)": pd.to_numeric(_latest.get("5日內最高漲幅(%)"), errors="coerce"),
-                "5日內最大回撤(%)": pd.to_numeric(_latest.get("5日內最大回撤(%)"), errors="coerce"),
+                "1日報酬(%)": pd.to_numeric(_latest["1日報酬(%)"] if "1日報酬(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "3日報酬(%)": pd.to_numeric(_latest["3日報酬(%)"] if "3日報酬(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "5日報酬(%)": pd.to_numeric(_latest["5日報酬(%)"] if "5日報酬(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "5日內最高漲幅(%)": pd.to_numeric(_latest["5日內最高漲幅(%)"] if "5日內最高漲幅(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "5日內最大回撤(%)": pd.to_numeric(_latest["5日內最大回撤(%)"] if "5日內最大回撤(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
                 "驗證結果": _latest.get("驗證結果","—")
             })
             st.dataframe(_show, width="stretch", hide_index=True)
@@ -1667,8 +1667,10 @@ with TAB_VALIDATE:
                 st.caption(f"平均報酬 {_s5['平均報酬']:+.2f}%｜中位數 {_s5['中位數報酬']:+.2f}%")
 
             # 整體最大有利/不利變動
-            best = pd.to_numeric(_mv.get("5日內最高漲幅(%)"), errors="coerce").dropna()
-            draw = pd.to_numeric(_mv.get("5日內最大回撤(%)"), errors="coerce").dropna()
+            _best_src = _mv["5日內最高漲幅(%)"] if "5日內最高漲幅(%)" in _mv.columns else pd.Series(dtype=float)
+            _draw_src = _mv["5日內最大回撤(%)"] if "5日內最大回撤(%)" in _mv.columns else pd.Series(dtype=float)
+            best = pd.to_numeric(_best_src, errors="coerce").dropna()
+            draw = pd.to_numeric(_draw_src, errors="coerce").dropna()
             d1,d2,d3 = st.columns(3)
             d1.metric("平均5日內最高漲幅", f"{best.mean():+.2f}%" if len(best) else "—")
             d2.metric("平均5日內最大回撤", f"{draw.mean():+.2f}%" if len(draw) else "—")
@@ -1886,7 +1888,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.16.1 雙軌＋獨立事件雷達
+### V6.16.2 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -1929,8 +1931,8 @@ with TAB_SETTINGS:
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
 
 
-# ===== V6.16.1 籌碼評分說明 =====
-with st.expander("🏦 V6.16.1 法人／大戶籌碼評分", expanded=False):
+# ===== V6.16.2 籌碼評分說明 =====
+with st.expander("🏦 V6.16.2 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -1945,7 +1947,7 @@ with st.expander("🏦 V6.16.1 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.16.1 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.16.2 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -1954,17 +1956,17 @@ with st.expander("🧠 V6.16.1 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.16.1 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.16.2 過熱判斷說明", expanded=False):
     st.markdown("""
-V6.16.1 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
+V6.16.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
 
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.16.1 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.16.2 昨日推薦驗證說明", expanded=False):
     st.markdown("""
-系統從 V6.16.1 起每天保存推薦快照，下一個有資料的交易日自動比對：
+系統從 V6.16.2 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
 
 目前「今日符合值」定義為：**昨日推薦股中，今日相對昨日基準價上漲至少 2% 的比例**。
@@ -1972,12 +1974,12 @@ with st.expander("📊 V6.16.1 昨日推薦驗證說明", expanded=False):
 """)
 
 
-with st.expander("📊 V6.16.1 多日績效驗證說明", expanded=False):
+with st.expander("📊 V6.16.2 多日績效驗證說明", expanded=False):
     st.markdown("""
 ### 為什麼要看 1 / 3 / 5 日？
 單看隔日漲跌很容易錯判模型。例如事件股可能隔日整理，但第3～5日才真正反彈。
 
-因此 V6.16.1 同時追蹤：
+因此 V6.16.2 同時追蹤：
 - **1日報酬**
 - **3日報酬**
 - **5日報酬**
