@@ -12,9 +12,141 @@ import streamlit as st
 
 from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
+
+# V6.16.1：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
+try:
+    from radar import overheat_score_v614
+except ImportError:
+    def overheat_score_v614(hist):
+        """內建備援過熱評分；當遠端 radar.py 尚未同步時仍可正常啟動。"""
+        if hist is None or len(hist) < 22:
+            return {
+                "過熱分數": 0,
+                "過熱等級": "⚪ 資料不足",
+                "過熱原因": "歷史資料不足",
+                "反轉風險": 0
+            }
+
+        x = add_indicators(hist)
+        r = x.iloc[-1]
+
+        def _s(v, d=0):
+            try:
+                return d if pd.isna(v) else float(v)
+            except Exception:
+                return d
+
+        close = _s(r.get("close"))
+        ma5 = _s(r.get("ma5"), close)
+        rsi = _s(r.get("rsi14"), 50)
+        dist = _s(r.get("dist_ma20"), 0)
+        bb = _s(r.get("bb_pos"), .5)
+        ret1 = _s(r.get("ret1"), 0)
+        ret3 = _s(r.get("ret3"), 0)
+        ret5 = _s(r.get("ret5"), 0)
+        ret10 = _s(r.get("ret10"), 0)
+        volr = _s(r.get("volume_ratio"), 1)
+        atr = _s(r.get("atr_pct"), .03)
+        loc = _s(r.get("close_location"), .5)
+        obv = _s(r.get("obv"), 0)
+        obvma = _s(r.get("obv_ma10"), obv)
+        high = _s(r.get("high"), close)
+        low = _s(r.get("low"), close)
+        op = _s(r.get("open"), close)
+
+        rng = max(high-low, 1e-9)
+        upper = max(0, high-max(op, close))/rng
+
+        score = 0
+        reasons = []
+
+        if rsi >= 85:
+            score += 20; reasons.append(f"RSI {rsi:.0f} 極端過熱")
+        elif rsi >= 78:
+            score += 16; reasons.append(f"RSI {rsi:.0f} 明顯過熱")
+        elif rsi >= 72:
+            score += 10; reasons.append(f"RSI {rsi:.0f} 偏熱")
+        elif rsi >= 68:
+            score += 5
+
+        dp = dist * 100
+        if dp >= 18:
+            score += 20; reasons.append(f"高於MA20約 {dp:.1f}%")
+        elif dp >= 13:
+            score += 16; reasons.append(f"MA20乖離 {dp:.1f}%")
+        elif dp >= 9:
+            score += 10
+        elif dp >= 6:
+            score += 5
+
+        if bb >= 1.15:
+            score += 10; reasons.append("價格明顯超出布林上緣")
+        elif bb >= 1.02:
+            score += 7
+        elif bb >= .9:
+            score += 3
+
+        if ret5 >= .15 or ret10 >= .25:
+            score += 15; reasons.append("短期漲幅過快")
+        elif ret5 >= .10 or ret10 >= .18:
+            score += 11
+        elif ret3 >= .07 or ret5 >= .07:
+            score += 6
+
+        if volr >= 3:
+            score += 10; reasons.append("高檔爆量")
+        elif volr >= 2:
+            score += 7
+        elif volr >= 1.5:
+            score += 4
+
+        if upper >= .45 and loc <= .55:
+            score += 10; reasons.append("高檔長上影、追價轉弱")
+        elif upper >= .3:
+            score += 6
+
+        if atr >= .065:
+            score += 5; reasons.append("波動率快速擴張")
+        elif atr >= .045:
+            score += 3
+
+        if close > ma5 and obv < obvma:
+            score += 6; reasons.append("股價強但OBV未同步")
+        if ret1 < 0 and ret5 > .08 and volr >= 1.5:
+            score += 4; reasons.append("急漲後爆量轉弱")
+
+        score = round(min(100, max(0, score)), 1)
+        if score >= 80:
+            level = "🔴 極度過熱"
+        elif score >= 65:
+            level = "🟠 明顯過熱"
+        elif score >= 50:
+            level = "🟡 偏熱觀察"
+        else:
+            level = "🟢 尚未過熱"
+
+        reversal = min(
+            100,
+            score*.65
+            + (15 if upper >= .4 else 0)
+            + (10 if ret1 < 0 and volr >= 1.5 else 0)
+            + (10 if obv < obvma else 0)
+        )
+
+        return {
+            "過熱分數": score,
+            "過熱等級": level,
+            "過熱原因": "；".join(reasons[:5]) if reasons else "未出現明顯過熱訊號",
+            "反轉風險": round(reversal, 1),
+            "RSI": round(rsi, 1),
+            "MA20乖離(%)": round(dp, 1),
+            "量比": round(volr, 2),
+            "近5日漲幅(%)": round(ret5*100, 1),
+            "近10日漲幅(%)": round(ret10*100, 1),
+        }
+
 from radar import chip_score_v611, blend_score_v611
 from radar import chip_event_v613, adjust_for_chip_event_v613
-from radar import overheat_score_v614
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
@@ -628,7 +760,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.16 獨立事件池：
+    """V6.16.1 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -703,7 +835,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
     out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
 
-    # V6.16：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    # V6.16.1：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
     out["事件等級"] = out["event_score"].map(event_grade)
     out = out[out["event_score"] >= 60].copy()
 
@@ -967,7 +1099,8 @@ def validation_summary(df, horizon_col):
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.16")
+st.title("📡 個人版台股權證雷達 V6.16.1")
+st.caption("V6.16.1｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -1115,7 +1248,7 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.16：獨立事件掃描，不經過權證活躍度預篩
+# V6.16.1：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
@@ -1245,7 +1378,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.16 事件雷達前10名
+    # V6.16.1 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1289,7 +1422,7 @@ c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破
 st.markdown("### 🧭 今日市場分析")
 st.info(market_summary_text(ranking, event_ranking))
 
-# V6.16 每日推薦驗證快照
+# V6.16.1 每日推薦驗證快照
 _previous_recs, _previous_rec_date = load_previous_recommendation_snapshot()
 save_recommendation_snapshot(ranking)
 
@@ -1356,7 +1489,7 @@ with TAB_TODAY:
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.16 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.16.1 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1393,7 +1526,7 @@ with TAB_EVENT:
             axis=1
         )
 
-        # V6.16 籌碼事件辨識
+        # V6.16.1 籌碼事件辨識
         _chip_events = _evt["code"].astype(str).map(chip_event_for_code)
         _evt["籌碼事件"] = _chip_events.map(lambda d: d.get("籌碼事件","⚪ 無法確認"))
         _evt["籌碼判斷信心"] = _chip_events.map(lambda d: d.get("判斷信心",0))
@@ -1481,7 +1614,7 @@ with TAB_EVENT:
 
 with TAB_VALIDATE:
     st.subheader("📊 推薦績效驗證｜1日・3日・5日")
-    st.caption("從 V6.15 起保存每日推薦快照；V6.16 會用後續交易日實際價格驗證 1/3/5 日表現。")
+    st.caption("從 V6.15 起保存每日推薦快照；V6.16.1 會用後續交易日實際價格驗證 1/3/5 日表現。")
 
     try:
         _vhist = pd.read_csv(VALIDATION_HISTORY_PATH, dtype={"code":str}) if VALIDATION_HISTORY_PATH.exists() else pd.DataFrame()
@@ -1753,7 +1886,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.16 雙軌＋獨立事件雷達
+### V6.16.1 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -1796,8 +1929,8 @@ with TAB_SETTINGS:
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
 
 
-# ===== V6.16 籌碼評分說明 =====
-with st.expander("🏦 V6.16 法人／大戶籌碼評分", expanded=False):
+# ===== V6.16.1 籌碼評分說明 =====
+with st.expander("🏦 V6.16.1 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -1812,7 +1945,7 @@ with st.expander("🏦 V6.16 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.16 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.16.1 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -1821,17 +1954,17 @@ with st.expander("🧠 V6.16 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.16 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.16.1 過熱判斷說明", expanded=False):
     st.markdown("""
-V6.16 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
+V6.16.1 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
 
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.16 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.16.1 昨日推薦驗證說明", expanded=False):
     st.markdown("""
-系統從 V6.16 起每天保存推薦快照，下一個有資料的交易日自動比對：
+系統從 V6.16.1 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
 
 目前「今日符合值」定義為：**昨日推薦股中，今日相對昨日基準價上漲至少 2% 的比例**。
@@ -1839,12 +1972,12 @@ with st.expander("📊 V6.16 昨日推薦驗證說明", expanded=False):
 """)
 
 
-with st.expander("📊 V6.16 多日績效驗證說明", expanded=False):
+with st.expander("📊 V6.16.1 多日績效驗證說明", expanded=False):
     st.markdown("""
 ### 為什麼要看 1 / 3 / 5 日？
 單看隔日漲跌很容易錯判模型。例如事件股可能隔日整理，但第3～5日才真正反彈。
 
-因此 V6.16 同時追蹤：
+因此 V6.16.1 同時追蹤：
 - **1日報酬**
 - **3日報酬**
 - **5日報酬**
