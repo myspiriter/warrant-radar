@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.13",
+  "version": "6.16",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -104,5 +104,22 @@
     "疑似大戶吸籌",
     "洗盤後承接",
     "無法確認"
+  ],
+  "overheat_radar": true,
+  "overheat_min_score": 50,
+  "yesterday_recommendation_validation": true,
+  "validation_hit_threshold_pct": 2,
+  "validation_horizons": [
+    1,
+    3,
+    5
+  ],
+  "validation_metrics": [
+    "return",
+    "max_favorable_excursion",
+    "max_drawdown",
+    "hit_rate",
+    "mean",
+    "median"
   ]
 }

@@ -781,3 +781,51 @@ def adjust_for_chip_event_v613(score, event_info):
     elif "換手" in event:
         base += 3*factor
     return round(max(0,min(100,base)),1)
+
+
+# ===== V6.14 過熱雷達 =====
+def overheat_score_v614(hist):
+    if hist is None or len(hist)<22:
+        return {"過熱分數":0,"過熱等級":"⚪ 資料不足","過熱原因":"歷史資料不足","反轉風險":0}
+    x=add_indicators(hist); r=x.iloc[-1]
+    def s(v,d=0):
+        try: return d if pd.isna(v) else float(v)
+        except: return d
+    close=s(r.close); ma5=s(r.ma5,close); ma20=s(r.ma20,close)
+    rsi=s(r.rsi14,50); dist=s(r.dist_ma20,0); bb=s(r.bb_pos,.5)
+    ret1=s(r.ret1); ret3=s(r.ret3); ret5=s(r.ret5); ret10=s(r.ret10)
+    volr=s(r.volume_ratio,1); atr=s(r.atr_pct,.03); loc=s(r.close_location,.5)
+    obv=s(r.obv); obvma=s(r.obv_ma10,obv)
+    high=s(r.high,close); low=s(r.low,close); op=s(r.open,close)
+    rng=max(high-low,1e-9); upper=max(0,high-max(op,close))/rng
+    score=0; reasons=[]
+    if rsi>=85: score+=20; reasons.append(f"RSI {rsi:.0f} 極端過熱")
+    elif rsi>=78: score+=16; reasons.append(f"RSI {rsi:.0f} 明顯過熱")
+    elif rsi>=72: score+=10; reasons.append(f"RSI {rsi:.0f} 偏熱")
+    elif rsi>=68: score+=5
+    dp=dist*100
+    if dp>=18: score+=20; reasons.append(f"高於MA20約 {dp:.1f}%")
+    elif dp>=13: score+=16; reasons.append(f"MA20乖離 {dp:.1f}%")
+    elif dp>=9: score+=10
+    elif dp>=6: score+=5
+    if bb>=1.15: score+=10; reasons.append("價格明顯超出布林上緣")
+    elif bb>=1.02: score+=7
+    elif bb>=.9: score+=3
+    if ret5>=.15 or ret10>=.25: score+=15; reasons.append("短期漲幅過快")
+    elif ret5>=.10 or ret10>=.18: score+=11
+    elif ret3>=.07 or ret5>=.07: score+=6
+    if volr>=3: score+=10; reasons.append("高檔爆量")
+    elif volr>=2: score+=7
+    elif volr>=1.5: score+=4
+    if upper>=.45 and loc<=.55: score+=10; reasons.append("高檔長上影、追價轉弱")
+    elif upper>=.3: score+=6
+    if atr>=.065: score+=5; reasons.append("波動率快速擴張")
+    elif atr>=.045: score+=3
+    if close>ma5 and obv<obvma: score+=6; reasons.append("股價強但OBV未同步")
+    if ret1<0 and ret5>.08 and volr>=1.5: score+=4; reasons.append("急漲後爆量轉弱")
+    score=round(min(100,max(0,score)),1)
+    level="🔴 極度過熱" if score>=80 else "🟠 明顯過熱" if score>=65 else "🟡 偏熱觀察" if score>=50 else "🟢 尚未過熱"
+    reversal=min(100,score*.65+(15 if upper>=.4 else 0)+(10 if ret1<0 and volr>=1.5 else 0)+(10 if obv<obvma else 0))
+    return {"過熱分數":score,"過熱等級":level,"過熱原因":"；".join(reasons[:5]) if reasons else "未出現明顯過熱訊號",
+            "反轉風險":round(reversal,1),"RSI":round(rsi,1),"MA20乖離(%)":round(dp,1),
+            "量比":round(volr,2),"近5日漲幅(%)":round(ret5*100,1),"近10日漲幅(%)":round(ret10*100,1)}
