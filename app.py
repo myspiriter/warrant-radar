@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -63,7 +64,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 st.set_page_config(page_title="個人版權證雷達", page_icon="📡", layout="wide")
-APP_VERSION = "V6.19.1｜NA 防呆修正版"
+APP_VERSION = "V6.19.2｜快速掃描修正版"
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -155,32 +156,42 @@ def issuer_from_name(name: str):
     return ""
 
 
+def _score_one_stock(code: str, extra: dict | None = None):
+    code = str(code).strip()
+    try:
+        h = load_hist(code)
+        health = hist_health(h)
+        s = stock_score(h)
+        row = {"code": code, **(extra or {}), **health}
+        if isinstance(s, dict):
+            row.update(s)
+        if health["歷史筆數"] < 45:
+            row["score"] = 0
+            row["setup"] = "資料不足"
+        return row
+    except Exception as e:
+        return {"code": code, **(extra or {}), "score": 0, "setup": "資料錯誤", "error": str(e)}
+
+
 def stock_ranking(watchlist):
-    base_cols = ["code","score","setup","close","ret1_pct","ret5_pct","volume_ratio","rsi14","ma20","資料狀態","歷史筆數","成功月份","抓取異常"]
-    rows = []
-    for code in watchlist:
-        try:
-            h = load_hist(code)
-            health = hist_health(h)
-            s = stock_score(h)
-            row = {"code":str(code), **health}
-            if isinstance(s, dict):
-                row.update(s)
-            if health["歷史筆數"] < 45:
-                row["score"] = 0
-                row["setup"] = "資料不足"
-            rows.append(row)
-        except Exception as e:
-            rows.append({"code":str(code), "score":0, "setup":"資料錯誤", "error":str(e)})
-    if not rows:
+    """固定關注股平行抓取，避免單一資料源 timeout 讓整頁卡十幾分鐘。"""
+    base_cols = ["code","score","setup","close","ret1_pct","ret5_pct","volume_ratio","rsi14","ma20","資料狀態","歷史筆數","成功月份","抓取異常","資料來源"]
+    codes = [str(c).strip() for c in watchlist if str(c).strip()]
+    if not codes:
         return pd.DataFrame(columns=base_cols)
-    out = pd.DataFrame(rows)
+    rows=[]
+    workers=min(8, max(1, len(codes)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs={ex.submit(_score_one_stock, c): c for c in codes}
+        for fut in as_completed(futs):
+            rows.append(fut.result())
+    out=pd.DataFrame(rows)
     for c in base_cols:
         if c not in out.columns:
-            out[c] = pd.NA
-    out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0)
-    out["setup"] = out["setup"].fillna("資料不足")
-    return out.sort_values("score", ascending=False).reset_index(drop=True)
+            out[c]=pd.NA
+    out["score"]=pd.to_numeric(out["score"],errors="coerce").fillna(0)
+    out["setup"]=out["setup"].fillna("資料不足")
+    return out.sort_values("score",ascending=False).reset_index(drop=True)
 
 
 
@@ -225,41 +236,34 @@ def build_dynamic_pool(all_stocks: pd.DataFrame, wb: pd.DataFrame, wv: pd.DataFr
     return s.sort_values("預篩分數",ascending=False).head(max_candidates).reset_index(drop=True)
 
 def dynamic_ranking(pool: pd.DataFrame):
+    """市場候選平行深度評分。候選數刻意限制，避免免費資料源被大量連續請求。"""
     base_cols = [
         "code","name","活躍權證數","現股成交量(張)","現股成交金額",
         "score","setup","close","ret1_pct","ret5_pct","volume_ratio","rsi14","ma20",
-        "資料狀態","歷史筆數","成功月份","抓取異常"
+        "資料狀態","歷史筆數","成功月份","抓取異常","資料來源"
     ]
     if pool is None or pool.empty:
         return pd.DataFrame(columns=base_cols)
-    rows=[]
+    jobs=[]
     for _,r in pool.iterrows():
         code=str(r.get("code","")).strip()
-        if not code:
-            continue
-        try:
-            h=load_hist(code)
-            health=hist_health(h)
-            s=stock_score(h)
-            row={"code":code,"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
-                 "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0), **health}
-            if isinstance(s, dict):
-                row.update(s)
-            if health["歷史筆數"] < 45:
-                row["score"] = 0
-                row["setup"] = "資料不足"
-            rows.append(row)
-        except Exception as e:
-            rows.append({"code":code,"name":r.get("name",""),"score":0,"setup":"資料錯誤","error":str(e)})
-    if not rows:
-        return pd.DataFrame(columns=base_cols)
+        if not code: continue
+        extra={"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
+               "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0)}
+        jobs.append((code,extra))
+    rows=[]
+    workers=min(8, max(1,len(jobs)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs={ex.submit(_score_one_stock, code, extra): code for code,extra in jobs}
+        for fut in as_completed(futs):
+            rows.append(fut.result())
     out=pd.DataFrame(rows)
     for c in base_cols:
-        if c not in out.columns:
-            out[c]=pd.NA
+        if c not in out.columns: out[c]=pd.NA
     out["score"]=pd.to_numeric(out["score"],errors="coerce").fillna(0)
     out["setup"]=out["setup"].fillna("資料不足")
     return out.sort_values("score",ascending=False).reset_index(drop=True)
+
 
 
 cfg = load_cfg()
@@ -308,8 +312,8 @@ with st.sidebar:
     min_stock_volume = st.number_input("現股最低成交量（張）", 0, 1000000, 1000, step=500)
     min_turnover_m = st.number_input("現股最低成交金額（百萬元）", 0, 100000, 50, step=10)
     min_liquid_warrants = st.number_input("至少活躍認購權證數", 1, 50, 3, step=1)
-    max_candidates = st.slider("進入深度評分候選數", 20, 100, 60, step=10)
-    st.caption("先用流動性與權證活躍度快速預篩，再對候選股計算技術/量價分數，避免全市場逐檔抓歷史造成過慢。")
+    max_candidates = st.slider("進入深度評分候選數", 10, 40, 20, step=5)
+    st.caption("快速模式預設只深度評分前 20 檔，並以最多 8 檔平行抓取；避免免費資料源 timeout 讓頁面卡住。")
 
     st.divider()
     st.header("我的關注股")

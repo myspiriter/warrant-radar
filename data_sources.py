@@ -41,7 +41,7 @@ def twse_stock_month(stock_no: str, month: Optional[str] = None) -> pd.DataFrame
     if month is None:
         month = date.today().strftime("%Y%m01")
     js = _get_json("https://www.twse.com.tw/rwd/zh/afterTrading/STOCK_DAY",
-                   {"date": month, "stockNo": stock_no, "response": "json"})
+                   {"date": month, "stockNo": stock_no, "response": "json"}, timeout=4, retries=0, backoff=0.2)
     fields, data = js.get("fields", []), js.get("data", [])
     if not data:
         return pd.DataFrame(columns=["date","open","high","low","close","volume"])
@@ -72,7 +72,7 @@ def yahoo_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
             js = _get_json(
                 f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
                 {"period1":period1,"period2":period2,"interval":"1d","events":"history","includeAdjustedClose":"true"},
-                timeout=15,retries=2,backoff=0.8,
+                timeout=4,retries=0,backoff=0.2,
             )
             result=(js.get("chart",{}).get("result") or [None])[0]
             if not result:
@@ -112,7 +112,7 @@ def finmind_stock_history(stock_no: str, months: int = 6) -> pd.DataFrame:
                 "start_date": start.strftime("%Y-%m-%d"),
                 "end_date": end.strftime("%Y-%m-%d"),
             },
-            timeout=20, retries=2, backoff=0.8,
+            timeout=4, retries=0, backoff=0.2,
         )
         data = js.get("data", []) if isinstance(js, dict) else []
         if not data:
