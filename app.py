@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -511,6 +512,7 @@ def build_dynamic_pool(all_stocks: pd.DataFrame, wb: pd.DataFrame, wv: pd.DataFr
     return s.sort_values("預篩分數",ascending=False).head(max_candidates).reset_index(drop=True)
 
 def dynamic_ranking(pool: pd.DataFrame):
+    """平行深度評分；保留完整評分邏輯，但避免逐檔等待免費資料源。"""
     base_cols = [
         "code","name","活躍權證數","現股成交量(張)","現股成交金額",
         "score","trend_score","event_score","score_mode","setup","close","ret1_pct","ret5_pct","ret20_pct",
@@ -519,21 +521,31 @@ def dynamic_ranking(pool: pd.DataFrame):
     ]
     if pool is None or pool.empty:
         return pd.DataFrame(columns=base_cols)
-    rows=[]
-    for _,r in pool.iterrows():
+
+    def work(r):
         code=str(r.get("code","")).strip()
         if not code:
-            continue
+            return None
         try:
             h=load_hist(code)
-            s=stock_score(h)
+            sc=stock_score(h)
             row={"code":code,"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
                  "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0)}
-            if isinstance(s, dict):
-                row.update(s)
-            rows.append(row)
+            if isinstance(sc, dict):
+                row.update(sc)
+            return row
         except Exception as e:
-            rows.append({"code":code,"name":r.get("name",""),"score":0,"setup":"資料錯誤","error":str(e)})
+            return {"code":code,"name":r.get("name",""),"score":0,"setup":"資料錯誤","error":str(e)}
+
+    records=pool.to_dict("records")
+    rows=[]
+    workers=min(8,max(1,len(records)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs=[ex.submit(work,r) for r in records]
+        for fut in as_completed(futs):
+            rr=fut.result()
+            if rr is not None:
+                rows.append(rr)
     if not rows:
         return pd.DataFrame(columns=base_cols)
     out=pd.DataFrame(rows)
@@ -789,7 +801,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
     return s.sort_values("_流動性分", ascending=False).head(max_candidates).reset_index(drop=True)
 
 def event_dynamic_ranking(event_pool: pd.DataFrame):
-    """只做事件型評分，不依賴權證門檻。"""
+    """事件型平行評分；功能不變，速度優先。"""
     base_cols = [
         "code","name","score","trend_score","event_score","score_mode","setup",
         "data_confidence","score_reason","close","ret1_pct","ret5_pct","ret20_pct",
@@ -799,51 +811,41 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     if event_pool is None or event_pool.empty:
         return pd.DataFrame(columns=base_cols)
 
-    rows = []
-    for _, r in event_pool.iterrows():
-        code = str(r.get("code","")).strip()
+    def work(r):
+        code=str(r.get("code","")).strip()
         if not code:
-            continue
+            return None
         try:
-            h = load_hist(code)
-            s = stock_score(h)
-            row = {
-                "code": code,
-                "name": r.get("name",""),
-                "現股成交量(張)": r.get("volume_lots", pd.NA),
-                "現股成交金額": r.get("turnover", pd.NA),
-            }
-            if isinstance(s, dict):
-                row.update(s)
-            rows.append(row)
+            h=load_hist(code)
+            sc=stock_score(h)
+            row={"code":code,"name":r.get("name",""),
+                 "現股成交量(張)":r.get("volume_lots",pd.NA),
+                 "現股成交金額":r.get("turnover",pd.NA)}
+            if isinstance(sc,dict): row.update(sc)
+            return row
         except Exception as e:
-            rows.append({
-                "code":code, "name":r.get("name",""),
-                "score":0, "event_score":0, "trend_score":0,
-                "score_mode":"資料錯誤", "setup":"資料錯誤",
-                "score_reason":str(e)
-            })
+            return {"code":code,"name":r.get("name",""),"score":0,"event_score":0,"trend_score":0,
+                    "score_mode":"資料錯誤","setup":"資料錯誤","score_reason":str(e)}
 
+    records=event_pool.to_dict("records")
+    rows=[]
+    workers=min(8,max(1,len(records)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs=[ex.submit(work,r) for r in records]
+        for fut in as_completed(futs):
+            rr=fut.result()
+            if rr is not None: rows.append(rr)
     if not rows:
         return pd.DataFrame(columns=base_cols)
-
-    out = pd.DataFrame(rows)
+    out=pd.DataFrame(rows)
     for c in base_cols:
-        if c not in out.columns:
-            out[c] = pd.NA
-
-    out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0)
-    out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
-    out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
-
-    # V6.17：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
-    out["事件等級"] = out["event_score"].map(event_grade)
-    out = out[out["event_score"] >= 60].copy()
-
-    return out.sort_values(
-        ["event_score","score"],
-        ascending=[False,False]
-    ).reset_index(drop=True)
+        if c not in out.columns: out[c]=pd.NA
+    out["score"]=pd.to_numeric(out["score"],errors="coerce").fillna(0)
+    out["event_score"]=pd.to_numeric(out["event_score"],errors="coerce").fillna(0)
+    out["trend_score"]=pd.to_numeric(out["trend_score"],errors="coerce").fillna(0)
+    out["事件等級"]=out["event_score"].map(event_grade)
+    out=out[out["event_score"]>=60].copy()
+    return out.sort_values(["event_score","score"],ascending=[False,False]).reset_index(drop=True)
 
 
 
@@ -906,11 +908,18 @@ def overheat_for_code(code):
 
 def build_overheat_ranking(stock_pool, max_scan=120):
     if stock_pool is None or stock_pool.empty: return pd.DataFrame()
-    rows=[]
-    for _,rr in stock_pool.head(max_scan).iterrows():
+    records=stock_pool.head(max_scan).to_dict("records")
+    def work(rr):
         code=str(rr.get("code",""))
-        if not code: continue
-        rows.append({"code":code,"name":rr.get("name",""),**overheat_for_code(code)})
+        if not code: return None
+        return {"code":code,"name":rr.get("name",""),**overheat_for_code(code)}
+    rows=[]
+    workers=min(8,max(1,len(records)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs=[ex.submit(work,r) for r in records]
+        for fut in as_completed(futs):
+            rr=fut.result()
+            if rr is not None: rows.append(rr)
     if not rows: return pd.DataFrame()
     out=pd.DataFrame(rows)
     out["過熱分數"]=pd.to_numeric(out["過熱分數"],errors="coerce").fillna(0)
@@ -1113,35 +1122,33 @@ def kd_decline_for_code(code):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def build_kd_decline_ranking(stock_records):
-    rows = []
+    """3K-2D 平行掃描。完整市場仍可用，但預設快速模式只掃高流動性前 200 檔。"""
+    records=[]
     for rr in stock_records:
-        code = str(rr.get("code","")).strip()
-        if not code or not re.fullmatch(r"\d{4}", code):
-            continue
-        d = kd_decline_for_code(code)
-        if d.get("符合條件", False):
-            rows.append({"code":code, "name":rr.get("name",""), **d})
+        code=str(rr.get("code","")).strip()
+        if code and re.fullmatch(r"\d{4}",code): records.append(rr)
 
-    if not rows:
-        return pd.DataFrame()
+    def work(rr):
+        code=str(rr.get("code","")).strip()
+        d=kd_decline_for_code(code)
+        return {"code":code,"name":rr.get("name",""),**d} if d.get("符合條件",False) else None
 
-    out = pd.DataFrame(rows)
-    out["連跌日數"] = pd.to_numeric(out["連跌日數"], errors="coerce").fillna(0)
-    out["K值"] = pd.to_numeric(out["K值"], errors="coerce")
-    out["D值"] = pd.to_numeric(out["D值"], errors="coerce")
-    out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
+    rows=[]
+    workers=min(8,max(1,len(records)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs=[ex.submit(work,rr) for rr in records]
+        for fut in as_completed(futs):
+            rr=fut.result()
+            if rr is not None: rows.append(rr)
+    if not rows: return pd.DataFrame()
+    out=pd.DataFrame(rows)
+    out["連跌日數"]=pd.to_numeric(out["連跌日數"],errors="coerce").fillna(0)
+    out["K值"]=pd.to_numeric(out["K值"],errors="coerce")
+    out["D值"]=pd.to_numeric(out["D值"],errors="coerce")
+    out["3K-2D"]=pd.to_numeric(out["3K-2D"],errors="coerce")
+    out["弱勢排序分"]=(out["連跌日數"].clip(upper=10)*10 + (-out["3K-2D"].clip(upper=0)).fillna(0)*3 + (20-out["K值"].clip(lower=0,upper=20)).fillna(0))
+    return out.sort_values(["KD超賣","弱勢排序分","連跌日數"],ascending=[False,False,False]).reset_index(drop=True)
 
-    # 越負、連跌越久、K值越低，排序越前
-    out["弱勢排序分"] = (
-        out["連跌日數"].clip(upper=10) * 10
-        + (-out["3K-2D"].clip(upper=0)).fillna(0) * 3
-        + (20 - out["K值"].clip(lower=0, upper=20)).fillna(0)
-    )
-
-    return out.sort_values(
-        ["KD超賣","弱勢排序分","連跌日數"],
-        ascending=[False,False,False]
-    ).reset_index(drop=True)
 
 
 def _ai_safe(v, default=0.0):
@@ -1252,7 +1259,7 @@ def build_unified_ai_ranking(base: pd.DataFrame, weights: dict) -> pd.DataFrame:
 
 cfg = load_cfg()
 st.title("📡 V7 AI PRO 統一台股／權證雷達")
-st.caption("V7.0｜AI 操盤＋個人版權證雷達正式合併｜所有推薦共用同一份真實市場掃描資料")
+st.caption("V7.0.1｜快速啟動版｜AI 操盤＋個人版權證雷達共用同一份真實市場資料")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -1324,9 +1331,12 @@ with st.sidebar:
     min_stock_volume = st.number_input("現股最低成交量（張）", 0, 1000000, 1000, step=500)
     min_turnover_m = st.number_input("現股最低成交金額（百萬元）", 0, 100000, 50, step=10)
     min_liquid_warrants = st.number_input("至少活躍認購權證數", 1, 50, 3, step=1)
-    max_candidates = st.slider("進入深度評分候選數", 20, 100, 60, step=10)
+    max_candidates = st.slider("進入深度評分候選數", 20, 100, 30, step=10)
     fallback_count = st.slider("正式預篩為0時，保底候選數", 10, 50, 30, step=5)
     show_funnel = st.toggle("顯示篩選漏斗診斷", value=True)
+    event_scan_count = st.slider("事件/過熱掃描檔數", 30, 120, 60, step=10)
+    kd_scan_mode = st.selectbox("3K-2D 掃描範圍", ["快速：高流動性前200檔", "完整：全市場（較久）"], index=0)
+    st.caption("快速模式保留全部功能；只有 3K-2D 全市場掃描改為可選，避免每次開頁就逐檔抓 1,000+ 檔歷史資料。")
     st.caption("先用流動性與權證活躍度快速預篩，再對候選股計算技術/量價分數，避免全市場逐檔抓歷史造成過慢。")
 
     st.divider()
@@ -1418,17 +1428,25 @@ event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
     min_turnover_m=min_turnover_m,
-    max_candidates=120
+    max_candidates=event_scan_count
 )
 with st.spinner("掃描全市場事件型機會…"):
     event_ranking = event_dynamic_ranking(event_pool)
 
 with st.spinner("掃描市場過熱股票…"):
-    overheat_ranking = build_overheat_ranking(event_pool, max_scan=120)
+    overheat_ranking = build_overheat_ranking(event_pool, max_scan=event_scan_count)
 
-with st.spinner("掃描全市場連跌＋3K-2D負值股票…"):
-    _kd_records = all_stocks[["code","name"]].to_dict("records") if all_stocks is not None and not all_stocks.empty else []
-    kd_decline_ranking = build_kd_decline_ranking(_kd_records)
+with st.spinner("掃描連跌＋3K-2D負值股票…"):
+    if all_stocks is not None and not all_stocks.empty:
+        _kd_base=all_stocks.copy()
+        _kd_base["turnover"]=pd.to_numeric(_kd_base.get("turnover"),errors="coerce").fillna(0)
+        _kd_base["volume_lots"]=pd.to_numeric(_kd_base.get("volume_lots"),errors="coerce").fillna(0)
+        if kd_scan_mode.startswith("快速"):
+            _kd_base=_kd_base.sort_values(["turnover","volume_lots"],ascending=False).head(200)
+        _kd_records=_kd_base[["code","name"]].to_dict("records")
+    else:
+        _kd_records=[]
+    kd_decline_ranking=build_kd_decline_ranking(_kd_records)
 
 # 固定關注股另外計算，不受每日 TOP 排名限制
 with st.spinner("更新我的關注股…"):
@@ -1861,7 +1879,7 @@ with TAB_EVENT:
 
 with TAB_KD:
     st.subheader("📉 全市場連跌＋3K-2D負值雷達")
-    st.caption("條件：收盤價連跌至少3個交易日，而且 3K－2D < 0。")
+    st.caption(f"條件：收盤價連跌至少3個交易日，而且 3K－2D < 0。｜目前掃描：{kd_scan_mode}")
 
     if kd_decline_ranking is None or kd_decline_ranking.empty:
         st.success("目前全市場沒有同時符合「連跌≥3日＋3K－2D<0」的股票。")
