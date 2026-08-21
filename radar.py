@@ -829,3 +829,84 @@ def overheat_score_v614(hist):
     return {"過熱分數":score,"過熱等級":level,"過熱原因":"；".join(reasons[:5]) if reasons else "未出現明顯過熱訊號",
             "反轉風險":round(reversal,1),"RSI":round(rsi,1),"MA20乖離(%)":round(dp,1),
             "量比":round(volr,2),"近5日漲幅(%)":round(ret5*100,1),"近10日漲幅(%)":round(ret10*100,1)}
+
+
+# ===== V6.17 連跌 + 3K-2D 弱勢雷達 =====
+def kd_decline_signal_v617(hist):
+    """連跌日數 + 標準KD(9,3,3) + 3K-2D。
+    篩選條件：連跌 >= 3 日 且 3K-2D < 0。
+    """
+    if hist is None or len(hist) < 12:
+        return {
+            "連跌日數": 0,
+            "K值": pd.NA,
+            "D值": pd.NA,
+            "3K-2D": pd.NA,
+            "KD狀態": "⚪ 資料不足",
+            "符合條件": False,
+            "KD超賣": False,
+            "最新收盤": pd.NA,
+        }
+
+    x = hist.copy().sort_values("date").reset_index(drop=True)
+    for c in ["high", "low", "close"]:
+        x[c] = pd.to_numeric(x[c], errors="coerce")
+
+    # 連跌日數：收盤價連續低於前一交易日收盤
+    diff = x["close"].diff()
+    decline_days = 0
+    for v in reversed(diff.iloc[1:].tolist()):
+        if pd.notna(v) and v < 0:
+            decline_days += 1
+        else:
+            break
+
+    # 標準 KD 9,3,3
+    low_n = x["low"].rolling(9).min()
+    high_n = x["high"].rolling(9).max()
+    denom = (high_n - low_n).replace(0, pd.NA)
+    rsv = (x["close"] - low_n) / denom * 100
+
+    K, D = [], []
+    k_prev, d_prev = 50.0, 50.0
+    for rv in rsv:
+        if pd.isna(rv):
+            K.append(pd.NA)
+            D.append(pd.NA)
+            continue
+        k_now = (2/3) * k_prev + (1/3) * float(rv)
+        d_now = (2/3) * d_prev + (1/3) * k_now
+        K.append(k_now)
+        D.append(d_now)
+        k_prev, d_prev = k_now, d_now
+
+    x["K"] = K
+    x["D"] = D
+
+    r = x.iloc[-1]
+    k = pd.to_numeric(r["K"], errors="coerce")
+    d = pd.to_numeric(r["D"], errors="coerce")
+    value_3k2d = (3 * k - 2 * d) if pd.notna(k) and pd.notna(d) else pd.NA
+
+    if pd.isna(k) or pd.isna(d):
+        status = "⚪ 資料不足"
+    elif value_3k2d < 0 and k <= 20 and d <= 20:
+        status = "🔴 3K-2D負值＋KD超賣"
+    elif value_3k2d < 0:
+        status = "🟠 3K-2D負值"
+    elif k <= 20 and d <= 20:
+        status = "🟡 KD低檔"
+    else:
+        status = "🟢 未達弱勢門檻"
+
+    return {
+        "連跌日數": int(decline_days),
+        "K值": round(float(k), 2) if pd.notna(k) else pd.NA,
+        "D值": round(float(d), 2) if pd.notna(d) else pd.NA,
+        "3K-2D": round(float(value_3k2d), 2) if pd.notna(value_3k2d) else pd.NA,
+        "KD狀態": status,
+        "符合條件": bool(decline_days >= 3 and pd.notna(value_3k2d) and value_3k2d < 0),
+        "KD超賣": bool(pd.notna(k) and pd.notna(d) and k <= 20 and d <= 20),
+        "最新收盤": round(float(x["close"].iloc[-1]), 4) if pd.notna(x["close"].iloc[-1]) else pd.NA,
+    }
+

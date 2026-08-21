@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.16.2",
+  "version": "7.0",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -125,5 +125,11 @@
   "import_guard": true,
   "overheat_local_fallback": true,
   "validation_missing_column_guard": true,
-  "validation_partial_history_supported": true
+  "validation_partial_history_supported": true,
+  "kd_decline_radar": true,
+  "kd_decline_min_days": 3,
+  "kd_negative_definition": "3K-2D<0",
+  "kd_oversold_threshold": 20,
+  "kd_full_market_scan": true,
+  "unified_ai_core": true
 }
