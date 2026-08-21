@@ -7,7 +7,7 @@ import pandas as pd
 import requests
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 WarrantRadar/6.17",
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 WarrantRadar/6.18",
     "Accept": "application/json,text/plain,*/*",
     "Referer": "https://www.twse.com.tw/",
 }
@@ -60,65 +60,69 @@ def twse_stock_month(stock_no: str, month: Optional[str] = None) -> pd.DataFrame
     df["volume"] = df["volume"] / 1000.0
     return df[["date","open","high","low","close","volume"]].dropna(subset=["close"])
 
-def twse_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
-    """
-    V6.17 resilient history loader.
-    - Retries transient TWSE failures instead of silently returning 0-score data.
-    - Records diagnostic metadata in DataFrame.attrs for the UI.
-    - If too few rows are returned, performs one slower recovery pass.
-    """
+def yahoo_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
+    """Secondary OHLCV source used only when TWSE history is incomplete."""
     stock_no = str(stock_no).strip()
-    today = pd.Timestamp.today().normalize()
-
-    def fetch_pass(delay: float, only_months=None):
-        frames, ok_months, errors = [], [], []
-        month_items = []
-        for i in range(months-1, -1, -1):
-            d = today - pd.DateOffset(months=i)
-            key = d.strftime("%Y%m01")
-            if only_months is None or key in only_months:
-                month_items.append(key)
-        for key in month_items:
-            try:
-                x = twse_stock_month(stock_no, key)
-                if x is not None and not x.empty:
-                    frames.append(x)
-                    ok_months.append(key[:6])
-                else:
-                    errors.append(f"{key[:6]}:空資料")
-            except Exception as e:
-                errors.append(f"{key[:6]}:{type(e).__name__}:{str(e)[:80]}")
-            time.sleep(delay + random.uniform(0.02, 0.08))
-        return frames, ok_months, errors
-
-    frames, ok_months, errors = fetch_pass(0.12)
-    if frames:
-        out = pd.concat(frames, ignore_index=True).drop_duplicates("date").sort_values("date")
-    else:
-        out = pd.DataFrame(columns=["date","open","high","low","close","volume"])
-
-    # A score typically needs ~20-40 sessions. If rate limiting caused holes, retry failed months slowly.
-    if len(out) < 45:
-        failed_keys = []
-        for i in range(months-1, -1, -1):
-            d = today - pd.DateOffset(months=i)
-            key = d.strftime("%Y%m01")
-            if key[:6] not in ok_months:
-                failed_keys.append(key)
-        if failed_keys:
-            time.sleep(0.6)
-            f2, ok2, err2 = fetch_pass(0.45, failed_keys)
-            errors.extend(err2)
-            ok_months.extend(ok2)
-            if f2:
-                out = pd.concat([out] + f2, ignore_index=True).drop_duplicates("date").sort_values("date")
-
-    out.attrs["history_source"] = "TWSE STOCK_DAY"
-    out.attrs["history_rows"] = int(len(out))
-    out.attrs["months_ok"] = sorted(set(ok_months))
-    out.attrs["history_errors"] = errors[-8:]
-    out.attrs["history_status"] = "正常" if len(out) >= 45 else ("部分資料" if len(out) else "無資料")
+    period2 = int(time.time())
+    period1 = period2 - int(max(months, 4) * 32 * 86400)
+    symbols = [f"{stock_no}.TW", f"{stock_no}.TWO"]
+    errors=[]
+    for symbol in symbols:
+        try:
+            js = _get_json(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                {"period1":period1,"period2":period2,"interval":"1d","events":"history","includeAdjustedClose":"true"},
+                timeout=15,retries=2,backoff=0.8,
+            )
+            result=(js.get("chart",{}).get("result") or [None])[0]
+            if not result:
+                errors.append(f"{symbol}:空資料"); continue
+            ts=result.get("timestamp") or []
+            q=((result.get("indicators",{}).get("quote") or [{}])[0])
+            if not ts: continue
+            df=pd.DataFrame({
+                "date":pd.to_datetime(ts,unit="s",utc=True).tz_convert("Asia/Taipei").normalize().tz_localize(None),
+                "open":q.get("open",[]),"high":q.get("high",[]),"low":q.get("low",[]),
+                "close":q.get("close",[]),"volume":q.get("volume",[]),
+            })
+            for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+            df["volume"]=df["volume"]/1000.0
+            df=df.dropna(subset=["close"]).drop_duplicates("date").sort_values("date")
+            if len(df):
+                df.attrs.update({"history_source":f"Yahoo Finance {symbol}","history_rows":len(df),"months_ok":["secondary"],"history_errors":errors,"history_status":"正常" if len(df)>=60 else "部分資料"})
+                return df
+        except Exception as e:
+            errors.append(f"{symbol}:{type(e).__name__}:{str(e)[:80]}")
+    out=pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    out.attrs.update({"history_source":"Yahoo Finance fallback","history_rows":0,"months_ok":[],"history_errors":errors[-4:],"history_status":"無資料"})
     return out
+
+def twse_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
+    """V6.18 dual-source loader: TWSE first, Yahoo fallback when <60 sessions."""
+    stock_no=str(stock_no).strip(); today=pd.Timestamp.today().normalize()
+    frames=[]; ok_months=[]; errors=[]
+    for i in range(months-1,-1,-1):
+        d=today-pd.DateOffset(months=i); key=d.strftime("%Y%m01")
+        try:
+            x=twse_stock_month(stock_no,key)
+            if x is not None and not x.empty: frames.append(x); ok_months.append(key[:6])
+            else: errors.append(f"{key[:6]}:空資料")
+        except Exception as e: errors.append(f"{key[:6]}:{type(e).__name__}:{str(e)[:80]}")
+        time.sleep(0.10+random.uniform(0.01,0.05))
+    tw=pd.concat(frames,ignore_index=True).drop_duplicates("date").sort_values("date") if frames else pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    # If TWSE is incomplete, switch to a second independent history source instead of hammering TWSE.
+    if len(tw) < 60:
+        y=yahoo_stock_history(stock_no,months=max(months,4))
+        if len(y) >= 60:
+            y.attrs["history_errors"]=(errors[-4:]+list(y.attrs.get("history_errors",[])))[-6:]
+            y.attrs["fallback_reason"]=f"TWSE僅{len(tw)}筆，自動切換第二資料源"
+            return y
+        if len(y)>len(tw):
+            y.attrs["history_status"]="部分資料" if len(y) else "無資料"
+            y.attrs["fallback_reason"]=f"TWSE僅{len(tw)}筆；第二來源亦不足"
+            return y
+    tw.attrs.update({"history_source":"TWSE STOCK_DAY","history_rows":len(tw),"months_ok":sorted(set(ok_months)),"history_errors":errors[-6:],"history_status":"正常" if len(tw)>=60 else ("部分資料" if len(tw) else "無資料")})
+    return tw
 
 def twse_all_stock_daily() -> pd.DataFrame:
     """TWSE 上市個股當日/最近交易日成交資訊。用於全市場第一層快速掃描。"""
@@ -184,6 +188,30 @@ def twse_warrant_basic() -> pd.DataFrame:
     x["warrant_type"]=x["warrant_type"].fillna("CALL").astype(str).apply(
         lambda v: "PUT" if ("售" in v or "PUT" in v.upper()) else "CALL")
     return x
+
+def derive_warrant_basic_from_daily(daily: pd.DataFrame, stocks: pd.DataFrame) -> pd.DataFrame:
+    """Degraded fallback for market scanning when TWSE warrant terms endpoint is empty.
+    Infers underlying from warrant name using current TWSE stock names. It is NOT used
+    for strike/expiry warrant selection because those fields are unavailable here.
+    """
+    cols=["warrant_code","warrant_name","underlying","issuer","warrant_type","strike","expiry","ratio","basic_source"]
+    if daily is None or daily.empty or stocks is None or stocks.empty or "warrant_name" not in daily.columns:
+        return pd.DataFrame(columns=cols)
+    names=stocks[["code","name"]].dropna().copy()
+    names["code"]=names["code"].astype(str).str.strip(); names["name"]=names["name"].astype(str).str.strip()
+    # Longest names first prevents short-name prefix collisions.
+    pairs=sorted([(n,c) for c,n in names[["code","name"]].itertuples(index=False,name=None) if n], key=lambda z:len(z[0]), reverse=True)
+    rows=[]
+    for _,r in daily.iterrows():
+        wn=str(r.get("warrant_name","") or "").strip(); code=str(r.get("warrant_code","") or "").strip()
+        underlying=None
+        for n,c in pairs:
+            if wn.startswith(n): underlying=c; break
+        if not underlying: continue
+        rows.append({"warrant_code":code,"warrant_name":wn,"underlying":underlying,"issuer":pd.NA,
+                     "warrant_type":"PUT" if "售" in wn else "CALL","strike":pd.NA,"expiry":pd.NaT,"ratio":pd.NA,
+                     "basic_source":"成交資料名稱推導"})
+    return pd.DataFrame(rows,columns=cols).drop_duplicates("warrant_code")
 
 def twse_warrant_daily_volume() -> pd.DataFrame:
     js = _get_json("https://openapi.twse.com.tw/v1/opendata/t187ap42_L")

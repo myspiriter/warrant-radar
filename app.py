@@ -9,7 +9,7 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes
+from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, derive_warrant_basic_from_daily
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 
 APP_DIR = Path(__file__).resolve().parent
@@ -63,7 +63,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 st.set_page_config(page_title="個人版權證雷達", page_icon="📡", layout="wide")
-APP_VERSION = "V6.17｜資料源容錯診斷版"
+APP_VERSION = "V6.18｜雙資料源＋權證容錯版"
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -71,14 +71,14 @@ def load_hist(code: str):
 
 def hist_health(h: pd.DataFrame) -> dict:
     if h is None:
-        return {"資料狀態":"無資料", "歷史筆數":0, "成功月份":"", "抓取異常":"回傳 None"}
+        return {"資料狀態":"無資料", "歷史筆數":0, "成功月份":"", "抓取異常":"回傳 None", "資料來源":""}
     attrs = getattr(h, "attrs", {}) or {}
     rows = int(attrs.get("history_rows", len(h)))
     status = attrs.get("history_status", "正常" if rows >= 45 else ("部分資料" if rows else "無資料"))
     months_ok = ",".join(attrs.get("months_ok", []))
     errs = attrs.get("history_errors", [])
     err_text = "；".join(errs[-3:]) if errs else ""
-    return {"資料狀態":status, "歷史筆數":rows, "成功月份":months_ok, "抓取異常":err_text}
+    return {"資料狀態":status, "歷史筆數":rows, "成功月份":months_ok, "抓取異常":err_text, "資料來源":attrs.get("history_source","")}
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_warrant_volume():
@@ -260,6 +260,10 @@ with st.spinner("掃描全市場與權證流動性…"):
     all_stocks = load_all_stocks()
     wvol = load_warrant_volume()
     wbasic = load_warrant_basic()
+    warrant_basic_fallback = False
+    if wbasic is None or wbasic.empty:
+        wbasic = derive_warrant_basic_from_daily(wvol, all_stocks)
+        warrant_basic_fallback = not wbasic.empty
 
 if not all_stocks.empty:
     for _, r in all_stocks[["code","name"]].dropna().iterrows():
@@ -271,8 +275,10 @@ with st.expander("🩺 資料健康檢查", expanded=(health_ok < 3)):
     h1,h2,h3 = st.columns(3)
     for col,(label,ok,count) in zip([h1,h2,h3],health_rows):
         col.metric(label, "正常" if ok else "異常/無資料", f"{count:,} 筆")
-    if health_ok < 3:
-        st.warning("部分公開資料源目前沒有回傳資料。v6 會降級運作，不會把『資料缺失』直接判定成『市場沒有機會』。")
+    if warrant_basic_fallback:
+        st.warning("權證基本資料主來源暫時無回傳；V6.18 已用權證成交資料＋股票名稱推導『標的代號』維持全市場預篩。此備援資料沒有履約價/到期日，因此最佳權證精選仍以主來源恢復或券商 CSV 為準。")
+    elif health_ok < 3:
+        st.warning("部分公開資料源目前沒有回傳資料。V6.18 會降級運作，不會把『資料缺失』直接判定成『市場沒有機會』。")
     else:
         st.success("策略掃描所需的三組公開資料均已取得。")
 
@@ -508,7 +514,7 @@ with TAB_WATCH:
                 diag["股票"] = diag["code"].astype(str).map(stock_label)
                 diag = diag[["股票"] + [c for c in diag_cols if c != "code"]]
             st.dataframe(diag, width="stretch", hide_index=True)
-            st.caption("V6.17 遇到 TWSE 暫時限流/500/429 會自動重試；仍不足時才標示資料不足，不再把抓取失敗誤當成市場 0 分。")
+            st.caption("V6.18：TWSE 歷史資料不足 60 筆時會自動切換第二資料源；權證基本資料主來源失效時，會用成交資料推導標的維持市場預篩。")
 
 with TAB_WARRANT:
     st.subheader("全權證排行")
