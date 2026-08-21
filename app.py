@@ -63,7 +63,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 st.set_page_config(page_title="個人版權證雷達", page_icon="📡", layout="wide")
-APP_VERSION = "V6.19｜穩定資料源＋推薦解耦版"
+APP_VERSION = "V6.19.1｜NA 防呆修正版"
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -361,6 +361,14 @@ if uploaded is not None:
     warrants=merge_warrant_volume(wterms,wvol)
 else:
     warrants=merge_warrant_volume(wbasic,wvol) if not wbasic.empty else pd.DataFrame()
+
+# V6.19.1 Pandas NA 防呆：備援權證資料的 issuer 可能是 pd.NA。
+# 舊版 radar.py 會用 `row.get("issuer") or ""`，pd.NA 不能直接做布林判斷，
+# 因此先在進入 rank_warrants 前統一轉成空字串，避免整個 Streamlit App 因單一缺值中斷。
+if isinstance(warrants, pd.DataFrame) and not warrants.empty:
+    for _text_col in ["issuer", "warrant_name", "warrant_code", "underlying", "warrant_type"]:
+        if _text_col in warrants.columns:
+            warrants[_text_col] = warrants[_text_col].fillna("").astype(str)
 
 # 資料新鮮度提示
 if not all_stocks.empty:
