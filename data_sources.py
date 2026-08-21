@@ -97,32 +97,94 @@ def yahoo_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
     out.attrs.update({"history_source":"Yahoo Finance fallback","history_rows":0,"months_ok":[],"history_errors":errors[-4:],"history_status":"無資料"})
     return out
 
+
+def finmind_stock_history(stock_no: str, months: int = 6) -> pd.DataFrame:
+    """Independent Taiwan stock EOD fallback via FinMind TaiwanStockPrice."""
+    stock_no = str(stock_no).strip()
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.DateOffset(months=max(months, 6))
+    try:
+        js = _get_json(
+            "https://api.finmindtrade.com/api/v4/data",
+            {
+                "dataset": "TaiwanStockPrice",
+                "data_id": stock_no,
+                "start_date": start.strftime("%Y-%m-%d"),
+                "end_date": end.strftime("%Y-%m-%d"),
+            },
+            timeout=20, retries=2, backoff=0.8,
+        )
+        data = js.get("data", []) if isinstance(js, dict) else []
+        if not data:
+            raise ValueError("FinMind 空資料")
+        df = pd.DataFrame(data)
+        aliases = {
+            "date":"date", "open":"open", "max":"high", "min":"low", "close":"close",
+            "Trading_Volume":"volume"
+        }
+        out = pd.DataFrame()
+        for src,dst in aliases.items():
+            out[dst] = df[src] if src in df.columns else pd.NA
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        for c in ["open","high","low","close","volume"]:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        out["volume"] = out["volume"] / 1000.0
+        out = out.dropna(subset=["date","close"]).drop_duplicates("date").sort_values("date")
+        out.attrs.update({
+            "history_source":"FinMind TaiwanStockPrice",
+            "history_rows":len(out),
+            "months_ok":["FinMind"],
+            "history_errors":[],
+            "history_status":"正常" if len(out)>=60 else ("部分資料" if len(out) else "無資料"),
+        })
+        return out
+    except Exception as e:
+        out = pd.DataFrame(columns=["date","open","high","low","close","volume"])
+        out.attrs.update({
+            "history_source":"FinMind fallback", "history_rows":0, "months_ok":[],
+            "history_errors":[f"FinMind:{type(e).__name__}:{str(e)[:100]}"], "history_status":"無資料"
+        })
+        return out
+
 def twse_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
-    """V6.18 dual-source loader: TWSE first, Yahoo fallback when <60 sessions."""
-    stock_no=str(stock_no).strip(); today=pd.Timestamp.today().normalize()
-    frames=[]; ok_months=[]; errors=[]
-    for i in range(months-1,-1,-1):
+    """V6.19 robust loader: FinMind first; TWSE monthly backup; Yahoo last resort.
+    This avoids hammering TWSE with many monthly requests during a market-wide scan.
+    """
+    stock_no=str(stock_no).strip()
+    # 1) One-request Taiwan-specific source. This is the normal path.
+    fm = finmind_stock_history(stock_no, months=max(months, 6))
+    if len(fm) >= 60:
+        return fm
+
+    # 2) TWSE official monthly endpoint as backup, with only 3 months to reduce throttling.
+    today=pd.Timestamp.today().normalize(); frames=[]; ok_months=[]; errors=list(fm.attrs.get("history_errors", []))
+    for i in range(2,-1,-1):
         d=today-pd.DateOffset(months=i); key=d.strftime("%Y%m01")
         try:
             x=twse_stock_month(stock_no,key)
-            if x is not None and not x.empty: frames.append(x); ok_months.append(key[:6])
-            else: errors.append(f"{key[:6]}:空資料")
-        except Exception as e: errors.append(f"{key[:6]}:{type(e).__name__}:{str(e)[:80]}")
-        time.sleep(0.10+random.uniform(0.01,0.05))
+            if x is not None and not x.empty:
+                frames.append(x); ok_months.append(key[:6])
+            else:
+                errors.append(f"TWSE {key[:6]}:空資料")
+        except Exception as e:
+            errors.append(f"TWSE {key[:6]}:{type(e).__name__}:{str(e)[:80]}")
+        time.sleep(0.05+random.uniform(0.01,0.03))
     tw=pd.concat(frames,ignore_index=True).drop_duplicates("date").sort_values("date") if frames else pd.DataFrame(columns=["date","open","high","low","close","volume"])
-    # If TWSE is incomplete, switch to a second independent history source instead of hammering TWSE.
-    if len(tw) < 60:
-        y=yahoo_stock_history(stock_no,months=max(months,4))
-        if len(y) >= 60:
-            y.attrs["history_errors"]=(errors[-4:]+list(y.attrs.get("history_errors",[])))[-6:]
-            y.attrs["fallback_reason"]=f"TWSE僅{len(tw)}筆，自動切換第二資料源"
-            return y
-        if len(y)>len(tw):
-            y.attrs["history_status"]="部分資料" if len(y) else "無資料"
-            y.attrs["fallback_reason"]=f"TWSE僅{len(tw)}筆；第二來源亦不足"
-            return y
-    tw.attrs.update({"history_source":"TWSE STOCK_DAY","history_rows":len(tw),"months_ok":sorted(set(ok_months)),"history_errors":errors[-6:],"history_status":"正常" if len(tw)>=60 else ("部分資料" if len(tw) else "無資料")})
-    return tw
+    if len(tw) >= 45:
+        tw.attrs.update({"history_source":"TWSE STOCK_DAY","history_rows":len(tw),"months_ok":sorted(set(ok_months)),"history_errors":errors[-6:],"history_status":"正常" if len(tw)>=60 else "部分資料"})
+        return tw
+
+    # 3) Last-resort Yahoo.
+    y=yahoo_stock_history(stock_no,months=max(months,4))
+    best=max([fm,tw,y], key=lambda x: len(x))
+    source=getattr(best,"attrs",{}).get("history_source", "fallback")
+    best.attrs.update({
+        "history_source":source, "history_rows":len(best),
+        "history_errors": (errors + list(getattr(y,"attrs",{}).get("history_errors",[])))[-8:],
+        "history_status":"正常" if len(best)>=60 else ("部分資料" if len(best) else "無資料"),
+        "fallback_reason":f"FinMind {len(fm)}筆 / TWSE {len(tw)}筆 / Yahoo {len(y)}筆",
+    })
+    return best
 
 def twse_all_stock_daily() -> pd.DataFrame:
     """TWSE 上市個股當日/最近交易日成交資訊。用於全市場第一層快速掃描。"""

@@ -63,7 +63,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
     })
 
 st.set_page_config(page_title="個人版權證雷達", page_icon="📡", layout="wide")
-APP_VERSION = "V6.18｜雙資料源＋權證容錯版"
+APP_VERSION = "V6.19｜穩定資料源＋推薦解耦版"
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -74,7 +74,7 @@ def hist_health(h: pd.DataFrame) -> dict:
         return {"資料狀態":"無資料", "歷史筆數":0, "成功月份":"", "抓取異常":"回傳 None", "資料來源":""}
     attrs = getattr(h, "attrs", {}) or {}
     rows = int(attrs.get("history_rows", len(h)))
-    status = attrs.get("history_status", "正常" if rows >= 45 else ("部分資料" if rows else "無資料"))
+    status = attrs.get("history_status", "正常" if rows >= 60 else ("部分資料" if rows else "無資料"))
     months_ok = ",".join(attrs.get("months_ok", []))
     errs = attrs.get("history_errors", [])
     err_text = "；".join(errs[-3:]) if errs else ""
@@ -166,7 +166,7 @@ def stock_ranking(watchlist):
             row = {"code":str(code), **health}
             if isinstance(s, dict):
                 row.update(s)
-            if health["歷史筆數"] < 20:
+            if health["歷史筆數"] < 45:
                 row["score"] = 0
                 row["setup"] = "資料不足"
             rows.append(row)
@@ -187,29 +187,41 @@ def stock_ranking(watchlist):
 def build_dynamic_pool(all_stocks: pd.DataFrame, wb: pd.DataFrame, wv: pd.DataFrame,
                        min_stock_volume=1000, min_turnover_m=50, min_liquid_warrants=3,
                        max_candidates=60):
-    """全市場第一層：只保留有權證、現股流動性正常、且有足夠活躍認購權證的股票。"""
-    if all_stocks.empty or wb.empty:
+    """V6.19: stock candidate discovery never depends on warrant metadata.
+    Warrant activity enriches ranking when available, but a broken warrant endpoint can no longer erase Today's picks.
+    """
+    if all_stocks is None or all_stocks.empty:
         return pd.DataFrame()
     s=all_stocks.copy()
+    s["code"]=s["code"].astype(str).str.strip()
     s=s[s["code"].str.fullmatch(r"\d{4}", na=False)]
-    s=s[(s["volume_lots"].fillna(0)>=min_stock_volume) & (s["turnover"].fillna(0)>=min_turnover_m*1_000_000)]
-    w=wb.copy()
-    w=w[w["warrant_type"].eq("CALL")]
-    if not wv.empty and "volume" in wv.columns:
-        w=w.merge(wv[["warrant_code","volume"]].drop_duplicates("warrant_code",keep="last"),
-                  on="warrant_code",how="left")
-    else:
-        w["volume"]=0
-    liquid=w[w["volume"].fillna(0)>=cfg["min_warrant_volume"]]
-    counts=liquid.groupby("underlying").agg(
-        活躍權證數=("warrant_code","nunique"),
-        權證總成交量=("volume","sum")
-    ).reset_index().rename(columns={"underlying":"code"})
-    s=s.merge(counts,on="code",how="inner")
-    s=s[s["活躍權證數"]>=min_liquid_warrants]
-    # 第一層優先看現股成交金額、權證活躍度，避免對全市場逐檔抓歷史造成速度過慢
-    s["預篩分數"]=(s["turnover"].rank(pct=True)*55 + s["權證總成交量"].rank(pct=True)*30 +
-                 s["活躍權證數"].rank(pct=True)*15)
+    s=s[(pd.to_numeric(s["volume_lots"],errors="coerce").fillna(0)>=min_stock_volume) &
+        (pd.to_numeric(s["turnover"],errors="coerce").fillna(0)>=min_turnover_m*1_000_000)]
+    if s.empty:
+        return s
+    s["活躍權證數"]=0
+    s["權證總成交量"]=0.0
+    warrant_ok = wb is not None and not wb.empty and "underlying" in wb.columns
+    if warrant_ok:
+        w=wb.copy()
+        if "warrant_type" in w.columns:
+            w=w[w["warrant_type"].fillna("CALL").eq("CALL")]
+        if wv is not None and not wv.empty and "volume" in wv.columns and "warrant_code" in w.columns:
+            w=w.merge(wv[["warrant_code","volume"]].drop_duplicates("warrant_code",keep="last"),on="warrant_code",how="left")
+        elif "volume" not in w.columns:
+            w["volume"]=0
+        liquid=w[pd.to_numeric(w["volume"],errors="coerce").fillna(0)>=cfg["min_warrant_volume"]]
+        if not liquid.empty:
+            counts=liquid.groupby("underlying").agg(活躍權證數=("warrant_code","nunique"),權證總成交量=("volume","sum")).reset_index().rename(columns={"underlying":"code"})
+            counts["code"]=counts["code"].astype(str)
+            s=s.drop(columns=["活躍權證數","權證總成交量"]).merge(counts,on="code",how="left")
+            s["活躍權證數"]=pd.to_numeric(s["活躍權證數"],errors="coerce").fillna(0)
+            s["權證總成交量"]=pd.to_numeric(s["權證總成交量"],errors="coerce").fillna(0)
+    # Stock liquidity always drives the base pool. Warrant data is only a bonus, never a gate.
+    turn_rank=s["turnover"].rank(pct=True)
+    vol_rank=s["volume_lots"].rank(pct=True)
+    warr_rank=s["權證總成交量"].rank(pct=True) if s["權證總成交量"].gt(0).any() else 0
+    s["預篩分數"]=turn_rank*60 + vol_rank*25 + warr_rank*15
     return s.sort_values("預篩分數",ascending=False).head(max_candidates).reset_index(drop=True)
 
 def dynamic_ranking(pool: pd.DataFrame):
@@ -233,7 +245,7 @@ def dynamic_ranking(pool: pd.DataFrame):
                  "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0), **health}
             if isinstance(s, dict):
                 row.update(s)
-            if health["歷史筆數"] < 20:
+            if health["歷史筆數"] < 45:
                 row["score"] = 0
                 row["setup"] = "資料不足"
             rows.append(row)
@@ -276,9 +288,9 @@ with st.expander("🩺 資料健康檢查", expanded=(health_ok < 3)):
     for col,(label,ok,count) in zip([h1,h2,h3],health_rows):
         col.metric(label, "正常" if ok else "異常/無資料", f"{count:,} 筆")
     if warrant_basic_fallback:
-        st.warning("權證基本資料主來源暫時無回傳；V6.18 已用權證成交資料＋股票名稱推導『標的代號』維持全市場預篩。此備援資料沒有履約價/到期日，因此最佳權證精選仍以主來源恢復或券商 CSV 為準。")
+        st.warning("權證基本資料主來源暫時無回傳；V6.19 的『今日推薦』已與權證資料解耦，仍會依現股流動性＋技術面正常產生候選。權證排行則以備援資料降級顯示。")
     elif health_ok < 3:
-        st.warning("部分公開資料源目前沒有回傳資料。V6.18 會降級運作，不會把『資料缺失』直接判定成『市場沒有機會』。")
+        st.warning("部分公開資料源目前沒有回傳資料。V6.19 會降級運作，不會把『資料缺失』直接判定成『市場沒有機會』。")
     else:
         st.success("策略掃描所需的三組公開資料均已取得。")
 
