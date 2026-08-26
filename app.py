@@ -3,7 +3,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -15,7 +14,7 @@ from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 from radar import kd_decline_signal_v617
 
-# V6.17：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
+# V6.18：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
 try:
     from radar import overheat_score_v614
 except ImportError:
@@ -512,7 +511,6 @@ def build_dynamic_pool(all_stocks: pd.DataFrame, wb: pd.DataFrame, wv: pd.DataFr
     return s.sort_values("預篩分數",ascending=False).head(max_candidates).reset_index(drop=True)
 
 def dynamic_ranking(pool: pd.DataFrame):
-    """平行深度評分；保留完整評分邏輯，但避免逐檔等待免費資料源。"""
     base_cols = [
         "code","name","活躍權證數","現股成交量(張)","現股成交金額",
         "score","trend_score","event_score","score_mode","setup","close","ret1_pct","ret5_pct","ret20_pct",
@@ -521,31 +519,21 @@ def dynamic_ranking(pool: pd.DataFrame):
     ]
     if pool is None or pool.empty:
         return pd.DataFrame(columns=base_cols)
-
-    def work(r):
+    rows=[]
+    for _,r in pool.iterrows():
         code=str(r.get("code","")).strip()
         if not code:
-            return None
+            continue
         try:
             h=load_hist(code)
-            sc=stock_score(h)
+            s=stock_score(h)
             row={"code":code,"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
                  "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0)}
-            if isinstance(sc, dict):
-                row.update(sc)
-            return row
+            if isinstance(s, dict):
+                row.update(s)
+            rows.append(row)
         except Exception as e:
-            return {"code":code,"name":r.get("name",""),"score":0,"setup":"資料錯誤","error":str(e)}
-
-    records=pool.to_dict("records")
-    rows=[]
-    workers=min(8,max(1,len(records)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs=[ex.submit(work,r) for r in records]
-        for fut in as_completed(futs):
-            rr=fut.result()
-            if rr is not None:
-                rows.append(rr)
+            rows.append({"code":code,"name":r.get("name",""),"score":0,"setup":"資料錯誤","error":str(e)})
     if not rows:
         return pd.DataFrame(columns=base_cols)
     out=pd.DataFrame(rows)
@@ -773,7 +761,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.17 獨立事件池：
+    """V6.18 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -801,7 +789,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
     return s.sort_values("_流動性分", ascending=False).head(max_candidates).reset_index(drop=True)
 
 def event_dynamic_ranking(event_pool: pd.DataFrame):
-    """事件型平行評分；功能不變，速度優先。"""
+    """只做事件型評分，不依賴權證門檻。"""
     base_cols = [
         "code","name","score","trend_score","event_score","score_mode","setup",
         "data_confidence","score_reason","close","ret1_pct","ret5_pct","ret20_pct",
@@ -811,41 +799,51 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     if event_pool is None or event_pool.empty:
         return pd.DataFrame(columns=base_cols)
 
-    def work(r):
-        code=str(r.get("code","")).strip()
+    rows = []
+    for _, r in event_pool.iterrows():
+        code = str(r.get("code","")).strip()
         if not code:
-            return None
+            continue
         try:
-            h=load_hist(code)
-            sc=stock_score(h)
-            row={"code":code,"name":r.get("name",""),
-                 "現股成交量(張)":r.get("volume_lots",pd.NA),
-                 "現股成交金額":r.get("turnover",pd.NA)}
-            if isinstance(sc,dict): row.update(sc)
-            return row
+            h = load_hist(code)
+            s = stock_score(h)
+            row = {
+                "code": code,
+                "name": r.get("name",""),
+                "現股成交量(張)": r.get("volume_lots", pd.NA),
+                "現股成交金額": r.get("turnover", pd.NA),
+            }
+            if isinstance(s, dict):
+                row.update(s)
+            rows.append(row)
         except Exception as e:
-            return {"code":code,"name":r.get("name",""),"score":0,"event_score":0,"trend_score":0,
-                    "score_mode":"資料錯誤","setup":"資料錯誤","score_reason":str(e)}
+            rows.append({
+                "code":code, "name":r.get("name",""),
+                "score":0, "event_score":0, "trend_score":0,
+                "score_mode":"資料錯誤", "setup":"資料錯誤",
+                "score_reason":str(e)
+            })
 
-    records=event_pool.to_dict("records")
-    rows=[]
-    workers=min(8,max(1,len(records)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs=[ex.submit(work,r) for r in records]
-        for fut in as_completed(futs):
-            rr=fut.result()
-            if rr is not None: rows.append(rr)
     if not rows:
         return pd.DataFrame(columns=base_cols)
-    out=pd.DataFrame(rows)
+
+    out = pd.DataFrame(rows)
     for c in base_cols:
-        if c not in out.columns: out[c]=pd.NA
-    out["score"]=pd.to_numeric(out["score"],errors="coerce").fillna(0)
-    out["event_score"]=pd.to_numeric(out["event_score"],errors="coerce").fillna(0)
-    out["trend_score"]=pd.to_numeric(out["trend_score"],errors="coerce").fillna(0)
-    out["事件等級"]=out["event_score"].map(event_grade)
-    out=out[out["event_score"]>=60].copy()
-    return out.sort_values(["event_score","score"],ascending=[False,False]).reset_index(drop=True)
+        if c not in out.columns:
+            out[c] = pd.NA
+
+    out["score"] = pd.to_numeric(out["score"], errors="coerce").fillna(0)
+    out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
+    out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
+
+    # V6.18：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    out["事件等級"] = out["event_score"].map(event_grade)
+    out = out[out["event_score"] >= 60].copy()
+
+    return out.sort_values(
+        ["event_score","score"],
+        ascending=[False,False]
+    ).reset_index(drop=True)
 
 
 
@@ -908,18 +906,11 @@ def overheat_for_code(code):
 
 def build_overheat_ranking(stock_pool, max_scan=120):
     if stock_pool is None or stock_pool.empty: return pd.DataFrame()
-    records=stock_pool.head(max_scan).to_dict("records")
-    def work(rr):
-        code=str(rr.get("code",""))
-        if not code: return None
-        return {"code":code,"name":rr.get("name",""),**overheat_for_code(code)}
     rows=[]
-    workers=min(8,max(1,len(records)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs=[ex.submit(work,r) for r in records]
-        for fut in as_completed(futs):
-            rr=fut.result()
-            if rr is not None: rows.append(rr)
+    for _,rr in stock_pool.head(max_scan).iterrows():
+        code=str(rr.get("code",""))
+        if not code: continue
+        rows.append({"code":code,"name":rr.get("name",""),**overheat_for_code(code)})
     if not rows: return pd.DataFrame()
     out=pd.DataFrame(rows)
     out["過熱分數"]=pd.to_numeric(out["過熱分數"],errors="coerce").fillna(0)
@@ -927,32 +918,49 @@ def build_overheat_ranking(stock_pool, max_scan=120):
 
 
 VALIDATION_HISTORY_PATH = APP_DIR / "recommendation_validation_history.csv"
+VALIDATION_BACKUP_PATH = APP_DIR / "recommendation_validation_history_backup.csv"
+
+def load_validation_history_all():
+    frames=[]
+    for p in [VALIDATION_HISTORY_PATH, VALIDATION_BACKUP_PATH]:
+        try:
+            if p.exists():
+                x=pd.read_csv(p,dtype={"code":str})
+                if not x.empty: frames.append(x)
+        except Exception:
+            pass
+    if not frames: return pd.DataFrame()
+    x=pd.concat(frames,ignore_index=True,sort=False)
+    if "snapshot_date" in x.columns and "code" in x.columns:
+        x=x.drop_duplicates(["snapshot_date","code"],keep="first")
+    return x
 
 def save_recommendation_snapshot(ranking):
-    """每日保留一次推薦快照，供下一交易日驗證。"""
-    if ranking is None or ranking.empty:
-        return
-    today = pd.Timestamp.today().strftime("%Y-%m-%d")
-    x = ranking.copy().head(20)
-    x["snapshot_date"] = today
-    x["code"] = x["code"].astype(str)
-    keep = [c for c in ["snapshot_date","code","name","score","close","setup","score_mode"] if c in x.columns]
-    x = x[keep]
+    """每天每檔只保存第一次正式推薦，避免刷新覆寫原始推薦。"""
+    if ranking is None or ranking.empty: return
+    today=pd.Timestamp.today().strftime("%Y-%m-%d")
+    x=ranking.copy().head(20)
+    x["snapshot_date"]=today
+    x["code"]=x["code"].astype(str)
+    keep=[c for c in ["snapshot_date","code","name","score","close","setup","score_mode","event_score"] if c in x.columns]
+    x=x[keep]
     try:
-        if VALIDATION_HISTORY_PATH.exists():
-            old=pd.read_csv(VALIDATION_HISTORY_PATH,dtype={"code":str})
-            # 同一天刷新只保留最新快照
-            old=old[old["snapshot_date"].astype(str)!=today]
-            x=pd.concat([old,x],ignore_index=True,sort=False)
-        x.to_csv(VALIDATION_HISTORY_PATH,index=False,encoding="utf-8-sig")
+        old=load_validation_history_all()
+        if not old.empty:
+            existing=set(zip(old["snapshot_date"].astype(str),old["code"].astype(str)))
+            x=x.loc[[(today,str(c)) not in existing for c in x["code"]]]
+            merged=pd.concat([old,x],ignore_index=True,sort=False)
+        else:
+            merged=x
+        merged=merged.drop_duplicates(["snapshot_date","code"],keep="first")
+        merged.to_csv(VALIDATION_HISTORY_PATH,index=False,encoding="utf-8-sig")
+        merged.to_csv(VALIDATION_BACKUP_PATH,index=False,encoding="utf-8-sig")
     except Exception:
         pass
 
 def load_previous_recommendation_snapshot():
     try:
-        if not VALIDATION_HISTORY_PATH.exists():
-            return pd.DataFrame(), None
-        x=pd.read_csv(VALIDATION_HISTORY_PATH,dtype={"code":str})
+        x=load_validation_history_all()
         if x.empty or "snapshot_date" not in x.columns:
             return pd.DataFrame(), None
         today=pd.Timestamp.today().strftime("%Y-%m-%d")
@@ -1122,144 +1130,33 @@ def kd_decline_for_code(code):
 
 @st.cache_data(ttl=1800, show_spinner=False)
 def build_kd_decline_ranking(stock_records):
-    """3K-2D 平行掃描。完整市場仍可用，但預設快速模式只掃高流動性前 200 檔。"""
-    records=[]
+    rows = []
     for rr in stock_records:
-        code=str(rr.get("code","")).strip()
-        if code and re.fullmatch(r"\d{4}",code): records.append(rr)
-
-    def work(rr):
-        code=str(rr.get("code","")).strip()
-        d=kd_decline_for_code(code)
-        return {"code":code,"name":rr.get("name",""),**d} if d.get("符合條件",False) else None
-
-    rows=[]
-    workers=min(8,max(1,len(records)))
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs=[ex.submit(work,rr) for rr in records]
-        for fut in as_completed(futs):
-            rr=fut.result()
-            if rr is not None: rows.append(rr)
-    if not rows: return pd.DataFrame()
-    out=pd.DataFrame(rows)
-    out["連跌日數"]=pd.to_numeric(out["連跌日數"],errors="coerce").fillna(0)
-    out["K值"]=pd.to_numeric(out["K值"],errors="coerce")
-    out["D值"]=pd.to_numeric(out["D值"],errors="coerce")
-    out["3K-2D"]=pd.to_numeric(out["3K-2D"],errors="coerce")
-    out["弱勢排序分"]=(out["連跌日數"].clip(upper=10)*10 + (-out["3K-2D"].clip(upper=0)).fillna(0)*3 + (20-out["K值"].clip(lower=0,upper=20)).fillna(0))
-    return out.sort_values(["KD超賣","弱勢排序分","連跌日數"],ascending=[False,False,False]).reset_index(drop=True)
-
-
-
-def _ai_safe(v, default=0.0):
-    try:
-        return default if pd.isna(v) else float(v)
-    except Exception:
-        return default
-
-
-def _ai_chip_proxy(code: str):
-    """Use the SAME real price/volume history as the warrant radar; never fabricate institutional data."""
-    try:
-        ce = chip_event_for_code(str(code))
-    except Exception:
-        ce = {}
-    event = str(ce.get("籌碼事件", "⚪ 無法確認"))
-    conf = _ai_safe(ce.get("判斷信心", 0), 0)
-    if "倒貨" in event:
-        base = 18
-    elif "吸籌" in event:
-        base = 82
-    elif "洗盤後承接" in event:
-        base = 78
-    elif "換手" in event:
-        base = 62
-    else:
-        base = 50
-    # Low-confidence recognition shrinks toward neutral 50.
-    proxy = 50 + (base - 50) * min(1.0, conf / 70.0)
-    return round(max(0, min(100, proxy)), 1), ce
-
-
-def _ai_rr(score, data_conf=100):
-    s = _ai_safe(score, 0)
-    conf = _ai_safe(data_conf, 70)
-    win = max(40, min(78, 45 + (s-50)*0.42 + (conf-70)*0.08))
-    gain = max(1.5, (s-50)*0.18)
-    loss = max(1.5, 5.2 - (s-50)*0.045)
-    return round(win,1), round(gain,1), round(loss,1), round(gain/loss,2)
-
-
-def build_unified_ai_ranking(base: pd.DataFrame, weights: dict) -> pd.DataFrame:
-    if base is None or base.empty:
-        return pd.DataFrame()
-    rows=[]
-    for _, r in base.iterrows():
-        code=str(r.get("code", "")).strip()
-        if not code:
+        code = str(rr.get("code","")).strip()
+        if not code or not re.fullmatch(r"\d{4}", code):
             continue
-        tech = _ai_safe(r.get("trend_score", r.get("score", 0)), 0)
-        event = _ai_safe(r.get("event_score", 0), 0)
-        # momentum + breakout are native V6 model factors, normalized to 0-100
-        mom = _ai_safe(r.get("momentum", 0), 0) / 12 * 50 + _ai_safe(r.get("breakout_quality",0),0) / 12 * 50
-        mom = max(0,min(100,mom))
-        chip, ce = _ai_chip_proxy(code)
-        try:
-            oh = overheat_for_code(code)
-        except Exception:
-            oh = {}
-        heat = _ai_safe(oh.get("過熱分數", 0), 0)
-        risk_control = max(0, 100-heat)
-        vals={"tech":tech,"event":event,"chip":chip,"momentum":mom,"risk":risk_control}
-        wsum=sum(max(0,float(weights.get(k,0))) for k in vals)
-        ai_score=sum(vals[k]*max(0,float(weights.get(k,0))) for k in vals)/(wsum or 1)
-        # Keep the original radar score as a stability anchor; both views now come from one data core.
-        base_score=_ai_safe(r.get("score",0),0)
-        ai_score=ai_score*0.78 + base_score*0.22
-        data_conf=_ai_safe(r.get("data_confidence",100),70)
-        ai_score = max(0,min(100, ai_score))
-        win,gain,loss,rr=_ai_rr(ai_score,data_conf)
-        if heat >= 88:
-            action="🔴 過熱避開"
-        elif ai_score >= 82 and win >= 58 and data_conf >= 65:
-            action="🟢 模擬買進"
-        elif ai_score >= 70:
-            action="🟡 重點觀察"
-        elif ai_score >= 58:
-            action="🟠 一般觀察"
-        else:
-            action="⚪ 暫不操作"
-        live_pct=pd.to_numeric(r.get("change_pct_live"),errors="coerce")
-        rows.append({
-            "代號":code,"股票":stock_label(code),"AI總分":round(ai_score,1),
-            "原雷達分數":round(base_score,1),"技術面":round(tech,1),"事件":round(event,1),
-            "籌碼／大戶代理":round(chip,1),"法人": "待法人資料源" ,"大戶":str(ce.get("籌碼事件","⚪ 無法確認")),
-            "動能／突破":round(mom,1),"過熱度":round(heat,1),"反轉風險":_ai_safe(oh.get("反轉風險",0),0),
-            "估計勝率%":win,"預期上漲%":gain,"預期風險%":loss,"報酬風險比":rr,
-            "資料信心%":round(data_conf,1),"AI動作":action,"盤中漲跌幅%":live_pct,
-            "籌碼事件判定":str(ce.get("籌碼事件","⚪ 無法確認")),
-            "籌碼事件原因":str(ce.get("判斷原因","—")),
-            "事件型機會原因":event_reason_text(r.to_dict()) if 'event_reason_text' in globals() else str(r.get("score_reason","—")),
-            "3K-2D":np.nan,"連跌天數":np.nan,
-        })
-    out=pd.DataFrame(rows)
-    if out.empty:
-        return out
-    # Merge the already-computed REAL 3K-2D radar so the AI page and legacy page cannot disagree.
-    try:
-        if kd_decline_ranking is not None and not kd_decline_ranking.empty:
-            k=kd_decline_ranking.copy()
-            k["代號"]=k["code"].astype(str)
-            keep=[c for c in ["代號","3K-2D","連跌天數"] if c in k.columns]
-            out=out.drop(columns=[c for c in ["3K-2D","連跌天數"] if c in out.columns]).merge(k[keep].drop_duplicates("代號"),on="代號",how="left")
-    except Exception:
-        pass
-    return out.sort_values("AI總分",ascending=False).reset_index(drop=True)
+        d = kd_decline_for_code(code)
+        if d.get("符合條件", False):
+            rows.append({"code":code, "name":rr.get("name",""), **d})
 
+    if not rows:
+        return pd.DataFrame()
+
+    out = pd.DataFrame(rows)
+    out["連跌日數"] = pd.to_numeric(out["連跌日數"], errors="coerce").fillna(0)
+    out["K值"] = pd.to_numeric(out["K值"], errors="coerce")
+    out["D值"] = pd.to_numeric(out["D值"], errors="coerce")
+    out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
+
+    # V6.18：3K-2D 越負排名越前；連跌日數作為次排序
+    out["連跌3日加強"] = out["連跌日數"] >= 3
+    return out.sort_values(
+        ["3K-2D","連跌日數","K值"], ascending=[True,False,True]
+    ).reset_index(drop=True)
 
 cfg = load_cfg()
-st.title("📡 V7 AI PRO 統一台股／權證雷達")
-st.caption("V7.0.1｜快速啟動版｜AI 操盤＋個人版權證雷達共用同一份真實市場資料")
+st.title("📡 個人版台股權證雷達 V6.18")
+st.caption("V6.18｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -1331,12 +1228,9 @@ with st.sidebar:
     min_stock_volume = st.number_input("現股最低成交量（張）", 0, 1000000, 1000, step=500)
     min_turnover_m = st.number_input("現股最低成交金額（百萬元）", 0, 100000, 50, step=10)
     min_liquid_warrants = st.number_input("至少活躍認購權證數", 1, 50, 3, step=1)
-    max_candidates = st.slider("進入深度評分候選數", 20, 100, 30, step=10)
+    max_candidates = st.slider("進入深度評分候選數", 20, 100, 60, step=10)
     fallback_count = st.slider("正式預篩為0時，保底候選數", 10, 50, 30, step=5)
     show_funnel = st.toggle("顯示篩選漏斗診斷", value=True)
-    event_scan_count = st.slider("事件/過熱掃描檔數", 30, 120, 60, step=10)
-    kd_scan_mode = st.selectbox("3K-2D 掃描範圍", ["快速：高流動性前200檔", "完整：全市場（較久）"], index=0)
-    st.caption("快速模式保留全部功能；只有 3K-2D 全市場掃描改為可選，避免每次開頁就逐檔抓 1,000+ 檔歷史資料。")
     st.caption("先用流動性與權證活躍度快速預篩，再對候選股計算技術/量價分數，避免全市場逐檔抓歷史造成過慢。")
 
     st.divider()
@@ -1356,19 +1250,6 @@ with st.sidebar:
     min_dte=st.number_input("最低剩餘天數",0,1000,int(cfg["min_days_to_expiry"]),step=10)
     max_otm=st.number_input("最大價外 %",0.0,100.0,float(cfg["max_otm_pct"]),step=1.0)
     cfg["min_warrant_volume"]=min_vol; cfg["min_days_to_expiry"]=min_dte; cfg["max_otm_pct"]=max_otm
-
-    st.divider()
-    st.header("🤖 AI 統一評分")
-    ai_min_score = st.slider("AI 最低觀察分數", 0, 100, 65, step=1)
-    ai_max_heat = st.slider("AI 最高過熱度", 0, 100, 85, step=1)
-    ai_capital = st.number_input("AI 模擬帳戶資金", 100000, 100000000, 10000000, step=100000)
-    with st.expander("AI 權重設定", expanded=False):
-        ai_w_tech = st.slider("技術／趨勢", 0, 50, 30, step=1)
-        ai_w_event = st.slider("事件", 0, 40, 20, step=1)
-        ai_w_chip = st.slider("籌碼事件／大戶代理", 0, 40, 15, step=1)
-        ai_w_momentum = st.slider("動能／突破", 0, 30, 15, step=1)
-        ai_w_risk = st.slider("風險／過熱控制", 0, 30, 20, step=1)
-    st.caption("法人真實買賣超若尚未串接，不會用假資料補分；AI 會以現有真實量價／事件／籌碼代理重新正規化權重。")
 
     st.divider()
     uploaded=st.file_uploader("補充券商權證 CSV（可選）",type=["csv"])
@@ -1423,30 +1304,22 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.17：獨立事件掃描，不經過權證活躍度預篩
+# V6.18：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
     min_turnover_m=min_turnover_m,
-    max_candidates=event_scan_count
+    max_candidates=120
 )
 with st.spinner("掃描全市場事件型機會…"):
     event_ranking = event_dynamic_ranking(event_pool)
 
 with st.spinner("掃描市場過熱股票…"):
-    overheat_ranking = build_overheat_ranking(event_pool, max_scan=event_scan_count)
+    overheat_ranking = build_overheat_ranking(event_pool, max_scan=120)
 
-with st.spinner("掃描連跌＋3K-2D負值股票…"):
-    if all_stocks is not None and not all_stocks.empty:
-        _kd_base=all_stocks.copy()
-        _kd_base["turnover"]=pd.to_numeric(_kd_base.get("turnover"),errors="coerce").fillna(0)
-        _kd_base["volume_lots"]=pd.to_numeric(_kd_base.get("volume_lots"),errors="coerce").fillna(0)
-        if kd_scan_mode.startswith("快速"):
-            _kd_base=_kd_base.sort_values(["turnover","volume_lots"],ascending=False).head(200)
-        _kd_records=_kd_base[["code","name"]].to_dict("records")
-    else:
-        _kd_records=[]
-    kd_decline_ranking=build_kd_decline_ranking(_kd_records)
+with st.spinner("掃描全市場連跌＋3K-2D負值股票…"):
+    _kd_records = all_stocks[["code","name"]].to_dict("records") if all_stocks is not None and not all_stocks.empty else []
+    kd_decline_ranking = build_kd_decline_ranking(_kd_records)
 
 # 固定關注股另外計算，不受每日 TOP 排名限制
 with st.spinner("更新我的關注股…"):
@@ -1565,7 +1438,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.17 事件雷達前10名
+    # V6.18 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1609,90 +1482,12 @@ c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破
 st.markdown("### 🧭 今日市場分析")
 st.info(market_summary_text(ranking, event_ranking))
 
-# V6.17 每日推薦驗證快照
+# V6.18 每日推薦驗證快照
 _previous_recs, _previous_rec_date = load_previous_recommendation_snapshot()
 save_recommendation_snapshot(ranking)
 
-# V7: AI and warrant radar share the exact same ranking/live/history core.
-ai_weights = {"tech":ai_w_tech,"event":ai_w_event,"chip":ai_w_chip,"momentum":ai_w_momentum,"risk":ai_w_risk}
-ai_ranking = build_unified_ai_ranking(ranking, ai_weights)
-
-TAB_AI, TAB_AI_ACCOUNT, TAB_AI_ERROR, TAB_TODAY, TAB_EVENT, TAB_OVERHEAT, TAB_KD, TAB_VALIDATE, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
-    ["🤖 AI統一排行","💰 AI模擬帳戶","🧠 AI錯誤分析","🔥 今日推薦","⚡ 事件型機會","🌡️ 過熱雷達","📉 連跌＋3K-2D","📊 昨日推薦驗證","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
-
-
-with TAB_AI:
-    st.subheader("🤖 AI 統一機會排行｜與權證雷達同一資料核心")
-    st.caption("此頁不再使用示範資料。技術、事件、過熱、3K-2D、盤中行情全部直接沿用本 App 同一次市場掃描。法人資料未串接時會明確標示『待法人資料源』，不會隨機造數。")
-    if ai_ranking.empty:
-        st.warning("目前沒有可供 AI 統一評分的市場資料。")
-    else:
-        af=ai_ranking[(ai_ranking["AI總分"]>=ai_min_score) & (ai_ranking["過熱度"]<=ai_max_heat)].copy()
-        a1,a2,a3,a4,a5=st.columns(5)
-        a1.metric("AI掃描",f"{len(ai_ranking)} 檔")
-        a2.metric("AI 80+",f"{int((ai_ranking['AI總分']>=80).sum())} 檔")
-        a3.metric("事件 80+",f"{int((ai_ranking['事件']>=80).sum())} 檔")
-        a4.metric("過熱警示",f"{int((ai_ranking['過熱度']>=85).sum())} 檔")
-        a5.metric("模擬買進",f"{int((ai_ranking['AI動作']=='🟢 模擬買進').sum())} 檔")
-        cols=["代號","股票","AI總分","原雷達分數","估計勝率%","報酬風險比","技術面","事件","籌碼／大戶代理","法人","大戶","過熱度","資料信心%","盤中漲跌幅%","AI動作"]
-        st.dataframe(af[[c for c in cols if c in af.columns]],width="stretch",hide_index=True)
-        with st.expander("AI 統一評分邏輯", expanded=False):
-            st.markdown(f"""
-- 技術／趨勢：**{ai_w_tech}**
-- 事件：**{ai_w_event}**
-- 籌碼事件／大戶代理：**{ai_w_chip}**
-- 動能／突破：**{ai_w_momentum}**
-- 風險／過熱控制：**{ai_w_risk}**
-- 再以原權證雷達現股分數做 22% 穩定錨定，避免新 AI 權重造成兩套推薦方向完全脫鉤。
-
-**法人欄目前不製造假分數。** 等未來串接真實外資／投信／自營商資料後，才會正式納入 AI 總分。
-            """)
-
-with TAB_AI_ACCOUNT:
-    st.subheader("💰 AI 模擬帳戶｜使用真實雷達候選")
-    if ai_ranking.empty:
-        st.info("目前沒有資料。")
-    else:
-        buys=ai_ranking[ai_ranking["AI動作"]=="🟢 模擬買進"].head(5).copy()
-        if buys.empty:
-            st.warning("目前沒有符合 AI 模擬買進條件的股票；不為了湊持倉而降低標準。")
-            buys=ai_ranking.head(5).copy()
-            buys["模擬狀態"]="觀察，不建倉"
-        else:
-            buys["模擬狀態"]="模擬建倉"
-        pos=min(0.05,0.25/max(1,len(buys))) if len(buys) else 0
-        buys["建議部位%"] = round(pos*100,1)
-        buys["模擬投入金額"] = int(ai_capital*pos)
-        invested=int(buys.loc[buys["模擬狀態"]=="模擬建倉","模擬投入金額"].sum()) if "模擬狀態" in buys else 0
-        m1,m2,m3,m4=st.columns(4)
-        m1.metric("模擬資金",f"NT$ {ai_capital:,.0f}")
-        m2.metric("模擬投入",f"NT$ {invested:,.0f}")
-        m3.metric("現金部位",f"NT$ {ai_capital-invested:,.0f}")
-        m4.metric("模擬持倉",int((buys["模擬狀態"]=="模擬建倉").sum()))
-        show=["代號","股票","AI總分","估計勝率%","報酬風險比","過熱度","建議部位%","模擬投入金額","模擬狀態"]
-        st.dataframe(buys[[c for c in show if c in buys.columns]],width="stretch",hide_index=True)
-        st.caption("此為模型驗證用模擬帳戶，不會自動下單。")
-
-with TAB_AI_ERROR:
-    st.subheader("🧠 AI 錯誤／矛盾訊號分析")
-    st.caption("直接檢查同一批真實市場資料中的模型矛盾，而不是用另一組示範股票。")
-    issues=[]
-    if not ai_ranking.empty:
-        for _,r in ai_ranking.iterrows():
-            if _ai_safe(r.get("AI總分"),0)>=75 and _ai_safe(r.get("過熱度"),0)>=80:
-                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"AI高分但已偏過熱","修正建議":"降低追價；等待量縮／回測／盤中止穩"})
-            if _ai_safe(r.get("事件"),0)>=80 and _ai_safe(r.get("籌碼／大戶代理"),50)<45:
-                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"事件強但籌碼代理偏弱","修正建議":"事件訊號需籌碼或法人後續確認"})
-            if _ai_safe(r.get("資料信心%"),100)<60:
-                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"資料信心偏低","修正建議":"暫不提高部位，先檢查資料異常診斷"})
-            live=pd.to_numeric(r.get("盤中漲跌幅%"),errors="coerce")
-            if _ai_safe(r.get("AI總分"),0)>=75 and pd.notna(live) and live<=-4:
-                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"高分但盤中明顯轉弱","修正建議":"等待止穩，不使用日線高分硬接跌勢"})
-    if issues:
-        st.dataframe(pd.DataFrame(issues).drop_duplicates(),width="stretch",hide_index=True)
-    else:
-        st.success("目前沒有明顯的模型矛盾訊號。")
-
+TAB_TODAY, TAB_EVENT, TAB_OVERHEAT, TAB_KD, TAB_VALIDATE, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
+    ["🔥 今日推薦","⚡ 事件型機會","🌡️ 過熱雷達","📉 連跌＋3K-2D","📊 昨日推薦驗證","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
 
 with TAB_TODAY:
     st.subheader("今日推薦")
@@ -1754,7 +1549,7 @@ with TAB_TODAY:
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.17 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.18 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1791,7 +1586,7 @@ with TAB_EVENT:
             axis=1
         )
 
-        # V6.17 籌碼事件辨識
+        # V6.18 籌碼事件辨識
         _chip_events = _evt["code"].astype(str).map(chip_event_for_code)
         _evt["籌碼事件"] = _chip_events.map(lambda d: d.get("籌碼事件","⚪ 無法確認"))
         _evt["籌碼判斷信心"] = _chip_events.map(lambda d: d.get("判斷信心",0))
@@ -1878,11 +1673,11 @@ with TAB_EVENT:
         d5.metric("事件風險", f"{_num0(_er.get('event_risk')):.0f}/20")
 
 with TAB_KD:
-    st.subheader("📉 全市場連跌＋3K-2D負值雷達")
-    st.caption(f"條件：收盤價連跌至少3個交易日，而且 3K－2D < 0。｜目前掃描：{kd_scan_mode}")
+    st.subheader("📉 全市場 3K-2D 負值排行")
+    st.caption("進榜條件：3K－2D < 0；連跌≥3日改為加強訊號。")
 
     if kd_decline_ranking is None or kd_decline_ranking.empty:
-        st.success("目前全市場沒有同時符合「連跌≥3日＋3K－2D<0」的股票。")
+        st.success("目前全市場沒有 3K－2D < 0 的股票。")
     else:
         _kd = kd_decline_ranking.copy()
         _kd["超賣狀態"] = _kd["KD超賣"].map({True:"🔥 K、D皆≤20", False:"—"})
@@ -1890,6 +1685,7 @@ with TAB_KD:
         _kdshow = pd.DataFrame({
             "股票": _kd["code"].astype(str).map(stock_label),
             "連跌日數": _kd["連跌日數"],
+            "連跌≥3日": _kd["連跌日數"].map(lambda x: "⭐ 是" if x >= 3 else "—"),
             "K值": _kd["K值"],
             "D值": _kd["D值"],
             "3K-2D": _kd["3K-2D"],
@@ -1932,10 +1728,10 @@ with TAB_KD:
 
 with TAB_VALIDATE:
     st.subheader("📊 推薦績效驗證｜1日・3日・5日")
-    st.caption("從 V6.15 起保存每日推薦快照；V6.17 會用後續交易日實際價格驗證 1/3/5 日表現。")
+    st.caption("從 V6.15 起保存每日推薦快照；V6.18 會用後續交易日實際價格驗證 1/3/5 日表現。")
 
     try:
-        _vhist = pd.read_csv(VALIDATION_HISTORY_PATH, dtype={"code":str}) if VALIDATION_HISTORY_PATH.exists() else pd.DataFrame()
+        _vhist = load_validation_history_all()
     except Exception:
         _vhist = pd.DataFrame()
 
@@ -2206,7 +2002,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.17 雙軌＋獨立事件雷達
+### V6.18 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -2246,13 +2042,11 @@ with TAB_SETTINGS:
 若你有券商 API，可把即時現股/權證 bid-ask、Delta、IV、有效槓桿直接餵給本 App；評分引擎不用重寫，只替換資料來源即可。
 """)
 
-st.markdown("### 🤖 V7 統一資料核心")
-st.info("AI 操盤、今日推薦、事件雷達、過熱雷達、3K-2D、固定關注與權證排行現在共用同一批市場掃描結果。AI 不再使用 V1 的隨機示範資料。")
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
 
 
-# ===== V6.17 籌碼評分說明 =====
-with st.expander("🏦 V6.17 法人／大戶籌碼評分", expanded=False):
+# ===== V6.18 籌碼評分說明 =====
+with st.expander("🏦 V6.18 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -2267,7 +2061,7 @@ with st.expander("🏦 V6.17 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.17 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.18 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -2276,17 +2070,17 @@ with st.expander("🧠 V6.17 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.17 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.18 過熱判斷說明", expanded=False):
     st.markdown("""
-V6.17 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
+V6.18 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
 
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.17 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.18 昨日推薦驗證說明", expanded=False):
     st.markdown("""
-系統從 V6.17 起每天保存推薦快照，下一個有資料的交易日自動比對：
+系統從 V6.18 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
 
 目前「今日符合值」定義為：**昨日推薦股中，今日相對昨日基準價上漲至少 2% 的比例**。
@@ -2294,12 +2088,12 @@ with st.expander("📊 V6.17 昨日推薦驗證說明", expanded=False):
 """)
 
 
-with st.expander("📊 V6.17 多日績效驗證說明", expanded=False):
+with st.expander("📊 V6.18 多日績效驗證說明", expanded=False):
     st.markdown("""
 ### 為什麼要看 1 / 3 / 5 日？
 單看隔日漲跌很容易錯判模型。例如事件股可能隔日整理，但第3～5日才真正反彈。
 
-因此 V6.17 同時追蹤：
+因此 V6.18 同時追蹤：
 - **1日報酬**
 - **3日報酬**
 - **5日報酬**
@@ -2312,7 +2106,7 @@ with st.expander("📊 V6.17 多日績效驗證說明", expanded=False):
 """)
 
 
-with st.expander("📉 V6.17 3K-2D弱勢雷達說明", expanded=False):
+with st.expander("📉 V6.18 3K-2D弱勢雷達說明", expanded=False):
     st.markdown("""
 ### 正式條件
 - **連續收盤下跌 ≥ 3 個交易日**
@@ -2328,4 +2122,12 @@ with st.expander("📉 V6.17 3K-2D弱勢雷達說明", expanded=False):
 
 這個雷達是用來找「已經連跌且短線動能非常弱」的股票，並不是直接買進訊號。
 若後續再搭配 **止跌、量縮、長下影、KD翻揚、法人回補或事件型承接**，才更適合觀察反彈機會。
+""")
+
+with st.expander("💾 V6.18 推薦歷史保存說明", expanded=False):
+    st.markdown("""
+V6.18 改為每天每檔保留**第一次正式推薦**，盤中刷新不覆寫原始分數與基準價，並同步寫入主檔與備援檔。
+
+注意：Streamlit Cloud 的執行磁碟不是永久資料庫。若重新部署，要真正延續舊歷史，需把既有的
+`recommendation_validation_history.csv` 一併保留在專案中；本版會自動合併主檔與備援檔並去重。
 """)
