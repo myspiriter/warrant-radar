@@ -661,3 +661,45 @@ def enrich_warrant_live(base: pd.DataFrame, max_codes=80) -> pd.DataFrame:
 
     return x
 
+
+
+def twse_recent_market_history(calendar_days: int = 35) -> pd.DataFrame:
+    """V6.18.3 高速批次日K：按交易日一次抓整個 TWSE 市場，而非逐檔逐月請求。
+    35 個日曆日通常可涵蓋 20+ 個交易日，足夠 KD(9,3,3) 與連跌計算。
+    """
+    today = pd.Timestamp.today().normalize()
+    frames = []
+    seen_dates = set()
+    for i in range(max(15, int(calendar_days))):
+        d = today - pd.Timedelta(days=i)
+        # 週末直接略過，減少無效 HTTP
+        if d.weekday() >= 5:
+            continue
+        ds = d.strftime("%Y%m%d")
+        try:
+            js = _get_json(
+                "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
+                {"date": ds, "type": "ALLBUT0999", "response": "json"},
+                timeout=12,
+            )
+            out = _parse_mi_index_json(js, ds)
+            if out is None or out.empty:
+                continue
+            # 同一天只收一次；保留正式日K OHLC
+            td = str(out.get("trade_date", pd.Series([ds])).iloc[0])
+            if td in seen_dates:
+                continue
+            seen_dates.add(td)
+            out = out[[c for c in ["code","name","trade_date","open","high","low","close","volume_lots"] if c in out.columns]].copy()
+            out["date"] = pd.to_datetime(ds, format="%Y%m%d", errors="coerce")
+            frames.append(out)
+        except Exception:
+            continue
+    if not frames:
+        return pd.DataFrame()
+    x = pd.concat(frames, ignore_index=True)
+    x["code"] = x["code"].astype(str).str.strip()
+    for c in ["open","high","low","close","volume_lots"]:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+    return x.dropna(subset=["date","close"]).sort_values(["code","date"]).reset_index(drop=True)

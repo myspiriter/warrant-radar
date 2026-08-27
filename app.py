@@ -10,7 +10,7 @@ import re
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live
+from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live, twse_recent_market_history
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 from radar import kd_decline_signal_v617
 
@@ -1117,43 +1117,32 @@ def validation_summary(df, horizon_col):
 
 
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def kd_decline_for_code(code):
-    try:
-        return kd_decline_signal_v617(load_hist(str(code)))
-    except Exception:
-        return {
-            "連跌日數":0, "K值":pd.NA, "D值":pd.NA, "3K-2D":pd.NA,
-            "KD狀態":"⚪ 資料錯誤", "符合條件":False, "KD超賣":False,
-            "最新收盤":pd.NA
-        }
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_bulk_kd_history():
+    # 一次按交易日抓整個市場，取代逐檔 4 個月份 HTTP 請求。
+    return twse_recent_market_history(calendar_days=35)
 
-@st.cache_data(ttl=1800, show_spinner=False)
-def build_kd_decline_ranking(stock_records):
-    rows = []
-    for rr in stock_records:
-        code = str(rr.get("code","")).strip()
-        if not code or not re.fullmatch(r"\d{4}", code):
+def build_kd_from_bulk_history(hist_all, stock_records=None):
+    if hist_all is None or hist_all.empty:
+        return pd.DataFrame()
+    names = {}
+    if stock_records:
+        names = {str(r.get("code","")).strip(): r.get("name","") for r in stock_records}
+    rows=[]
+    for code,g in hist_all.groupby("code", sort=False):
+        code=str(code).strip()
+        if not re.fullmatch(r"\d{4}",code):
             continue
-        d = kd_decline_for_code(code)
-        if d.get("符合條件", False):
-            rows.append({"code":code, "name":rr.get("name",""), **d})
-
+        d=kd_decline_signal_v617(g[["date","open","high","low","close"]].copy())
+        if d.get("符合條件",False):
+            rows.append({"code":code,"name":names.get(code, g["name"].iloc[-1] if "name" in g else ""),**d})
     if not rows:
         return pd.DataFrame()
-
-    out = pd.DataFrame(rows)
-    out["連跌日數"] = pd.to_numeric(out["連跌日數"], errors="coerce").fillna(0)
-    out["K值"] = pd.to_numeric(out["K值"], errors="coerce")
-    out["D值"] = pd.to_numeric(out["D值"], errors="coerce")
-    out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
-
-    # V6.18.2：3K-2D 越負排名越前；連跌日數作為次排序
-    out["連跌3日加強"] = out["連跌日數"] >= 3
-    return out.sort_values(
-        ["3K-2D","連跌日數","K值"], ascending=[True,False,True]
-    ).reset_index(drop=True)
-
+    out=pd.DataFrame(rows)
+    for c in ["連跌日數","K值","D值","3K-2D"]:
+        out[c]=pd.to_numeric(out[c],errors="coerce")
+    out["連跌3日加強"]=out["連跌日數"].fillna(0)>=3
+    return out.sort_values(["3K-2D","連跌日數","K值"],ascending=[True,False,True]).reset_index(drop=True)
 
 KD_CACHE_PATH = Path("/tmp/warrant_radar_kd_cache.csv")
 VALIDATION_CACHE_PATH = Path("/tmp/warrant_radar_validation_cache.csv")
@@ -1179,24 +1168,10 @@ def save_kd_cached_result(df):
     except Exception:
         pass
 
-def fast_kd_prefilter(all_stocks, max_candidates=350):
-    if all_stocks is None or all_stocks.empty:
-        return []
-    x = all_stocks.copy()
-    x["code"] = x["code"].astype(str).str.strip()
-    x = x[x["code"].str.fullmatch(r"\d{4}",na=False)].copy()
-    for c in ["volume_lots","turnover","change"]:
-        if c in x.columns:
-            x[c] = pd.to_numeric(x[c],errors="coerce")
-    if "change" in x.columns and x["change"].notna().any():
-        x = x[x["change"].fillna(0) <= 0].copy()
-    x["_a"] = x["turnover"].fillna(0).rank(pct=True) if "turnover" in x.columns else 0
-    x["_b"] = x["volume_lots"].fillna(0).rank(pct=True) if "volume_lots" in x.columns else 0
-    x["_s"] = x["_a"]*.65 + x["_b"]*.35
-    return x.sort_values("_s",ascending=False).head(max_candidates)[["code","name"]].to_dict("records")
-
-def run_kd_scan_fast(all_stocks, max_candidates=350):
-    return build_kd_decline_ranking(fast_kd_prefilter(all_stocks,max_candidates))
+def run_kd_scan_fast(all_stocks, max_candidates=None):
+    hist_all=load_bulk_kd_history()
+    records=[] if all_stocks is None or all_stocks.empty else all_stocks[["code","name"]].drop_duplicates("code").to_dict("records")
+    return build_kd_from_bulk_history(hist_all,records)
 
 def attach_live_snapshot_to_kd(kd_df, all_stocks):
     """正式KD使用完整日K；盤中行情只另欄顯示。"""
@@ -1762,19 +1737,21 @@ with TAB_EVENT:
 
 with TAB_KD:
     st.subheader("📉 全市場 3K-2D 負值排行")
-    st.caption("V6.18.2：3K-2D、K、D、連跌日數只用完整日K；盤中價格另外顯示。")
+    st.caption("V6.18.3：高速批次日K掃描。一次抓整體市場交易日資料，再於本機計算 3K-2D；盤中價格另外顯示。")
 
     k1,k2,k3=st.columns([2,1,1])
     with k1:
-        kd_scan_size=st.slider("本次掃描候選數",150,600,350,50)
+        st.metric("掃描模式","⚡ 全市場批次")
+        st.caption("不再逐檔下載歷史資料；日K快取 6 小時。")
     with k2:
         st.write(""); st.write("")
-        kd_run=st.button("🔎 掃描 3K-2D",use_container_width=True)
+        kd_run=st.button("🔎 高速掃描 3K-2D",use_container_width=True)
     with k3:
         st.write(""); st.write("")
         kd_force=st.button("♻️ 強制更新日K",use_container_width=True)
 
     if kd_force:
+        load_bulk_kd_history.clear()
         st.session_state.pop("kd_decline_cached",None)
         st.session_state.pop("kd_decline_cached_at",None)
         try:
@@ -1784,9 +1761,9 @@ with TAB_KD:
         kd_run=True
 
     if kd_run:
-        with st.spinner(f"重新取得歷史日K並計算約 {kd_scan_size} 檔…"):
+        with st.spinner("批次取得近期完整日K並計算全市場 3K-2D…"):
             try:
-                res=run_kd_scan_fast(all_stocks,kd_scan_size)
+                res=run_kd_scan_fast(all_stocks)
                 save_kd_cached_result(res)
             except Exception as e:
                 st.error(f"3K-2D更新失敗：{e}")
@@ -2110,7 +2087,7 @@ st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能�
 
 
 # ===== V6.18.2 籌碼評分說明 =====
-with st.expander("🏦 V6.18.2 法人／大戶籌碼評分", expanded=False):
+with st.expander("🏦 V6.18.3 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -2125,7 +2102,7 @@ with st.expander("🏦 V6.18.2 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.18.2 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.18.3 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -2134,7 +2111,7 @@ with st.expander("🧠 V6.18.2 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.18.2 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.18.3 過熱判斷說明", expanded=False):
     st.markdown("""
 V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
@@ -2142,7 +2119,7 @@ V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交�
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.18.2 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.18.3 昨日推薦驗證說明", expanded=False):
     st.markdown("""
 系統從 V6.18.2 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
@@ -2170,7 +2147,7 @@ with st.expander("📊 V6.18.2 多日績效驗證說明", expanded=False):
 """)
 
 
-with st.expander("📉 V6.18.2 3K-2D弱勢雷達說明", expanded=False):
+with st.expander("📉 V6.18.3 3K-2D弱勢雷達說明", expanded=False):
     st.markdown("""
 ### 正式條件
 - **連續收盤下跌 ≥ 3 個交易日**
