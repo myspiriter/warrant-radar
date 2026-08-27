@@ -14,7 +14,7 @@ from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 from radar import kd_decline_signal_v617
 
-# V6.18.1：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
+# V6.18.2：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
 try:
     from radar import overheat_score_v614
 except ImportError:
@@ -761,7 +761,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.18.1 獨立事件池：
+    """V6.18.2 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -836,7 +836,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
     out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
 
-    # V6.18.1：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    # V6.18.2：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
     out["事件等級"] = out["event_score"].map(event_grade)
     out = out[out["event_score"] >= 60].copy()
 
@@ -1148,7 +1148,7 @@ def build_kd_decline_ranking(stock_records):
     out["D值"] = pd.to_numeric(out["D值"], errors="coerce")
     out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
 
-    # V6.18.1：3K-2D 越負排名越前；連跌日數作為次排序
+    # V6.18.2：3K-2D 越負排名越前；連跌日數作為次排序
     out["連跌3日加強"] = out["連跌日數"] >= 3
     return out.sort_values(
         ["3K-2D","連跌日數","K值"], ascending=[True,False,True]
@@ -1198,6 +1198,31 @@ def fast_kd_prefilter(all_stocks, max_candidates=350):
 def run_kd_scan_fast(all_stocks, max_candidates=350):
     return build_kd_decline_ranking(fast_kd_prefilter(all_stocks,max_candidates))
 
+def attach_live_snapshot_to_kd(kd_df, all_stocks):
+    """正式KD使用完整日K；盤中行情只另欄顯示。"""
+    if kd_df is None or kd_df.empty:
+        return pd.DataFrame()
+    out=kd_df.copy()
+    out["code"]=out["code"].astype(str).str.strip()
+    out["日K收盤"]=pd.to_numeric(out.get("最新收盤"),errors="coerce")
+    out["盤中價格"]=pd.NA
+    out["盤中漲跌幅(%)"]=pd.NA
+    if all_stocks is not None and not all_stocks.empty:
+        live=all_stocks.copy()
+        live["code"]=live["code"].astype(str).str.strip()
+        price_col="close" if "close" in live.columns else None
+        pct_col="change_pct" if "change_pct" in live.columns else ("change" if "change" in live.columns else None)
+        cols=["code"]+([price_col] if price_col else [])+([pct_col] if pct_col else [])
+        live=live[cols].drop_duplicates("code",keep="last")
+        ren={}
+        if price_col: ren[price_col]="_live_price"
+        if pct_col: ren[pct_col]="_live_pct"
+        out=out.merge(live.rename(columns=ren),on="code",how="left")
+        if "_live_price" in out: out["盤中價格"]=pd.to_numeric(out["_live_price"],errors="coerce")
+        if "_live_pct" in out: out["盤中漲跌幅(%)"]=pd.to_numeric(out["_live_pct"],errors="coerce")
+    out["KD資料基準"]="完整日K"
+    return out
+
 def load_validation_cached_result():
     x = st.session_state.get("validation_cached")
     if isinstance(x,pd.DataFrame):
@@ -1220,8 +1245,8 @@ def save_validation_cached_result(df):
 
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.18.1")
-st.caption("V6.18.1｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
+st.title("📡 個人版台股權證雷達 V6.18.2")
+st.caption("V6.18.2｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -1369,7 +1394,7 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.18.1：獨立事件掃描，不經過權證活躍度預篩
+# V6.18.2：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
@@ -1382,7 +1407,7 @@ with st.spinner("掃描全市場事件型機會…"):
 with st.spinner("掃描市場過熱股票…"):
     overheat_ranking = build_overheat_ranking(event_pool, max_scan=120)
 
-# V6.18.1：KD 改為手動觸發。
+# V6.18.2：KD 改為手動觸發。
 
 # 固定關注股另外計算，不受每日 TOP 排名限制
 with st.spinner("更新我的關注股…"):
@@ -1501,7 +1526,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.18.1 事件雷達前10名
+    # V6.18.2 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1545,7 +1570,7 @@ c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破
 st.markdown("### 🧭 今日市場分析")
 st.info(market_summary_text(ranking, event_ranking))
 
-# V6.18.1 每日推薦驗證快照
+# V6.18.2 每日推薦驗證快照
 _previous_recs, _previous_rec_date = load_previous_recommendation_snapshot()
 save_recommendation_snapshot(ranking)
 
@@ -1612,7 +1637,7 @@ with TAB_TODAY:
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.18.1 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.18.2 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1649,7 +1674,7 @@ with TAB_EVENT:
             axis=1
         )
 
-        # V6.18.1 籌碼事件辨識
+        # V6.18.2 籌碼事件辨識
         _chip_events = _evt["code"].astype(str).map(chip_event_for_code)
         _evt["籌碼事件"] = _chip_events.map(lambda d: d.get("籌碼事件","⚪ 無法確認"))
         _evt["籌碼判斷信心"] = _chip_events.map(lambda d: d.get("判斷信心",0))
@@ -1737,42 +1762,60 @@ with TAB_EVENT:
 
 with TAB_KD:
     st.subheader("📉 全市場 3K-2D 負值排行")
-    st.caption("效能模式：不在App啟動時掃全市場。按按鈕才掃描，結果會快取。")
+    st.caption("V6.18.2：3K-2D、K、D、連跌日數只用完整日K；盤中價格另外顯示。")
 
-    _k1,_k2 = st.columns([2,1])
-    with _k1:
-        kd_scan_size = st.slider("本次掃描候選數",150,600,350,50)
-    with _k2:
-        st.write("")
-        st.write("")
-        kd_run = st.button("🔎 掃描 3K-2D",use_container_width=True)
+    k1,k2,k3=st.columns([2,1,1])
+    with k1:
+        kd_scan_size=st.slider("本次掃描候選數",150,600,350,50)
+    with k2:
+        st.write(""); st.write("")
+        kd_run=st.button("🔎 掃描 3K-2D",use_container_width=True)
+    with k3:
+        st.write(""); st.write("")
+        kd_force=st.button("♻️ 強制更新日K",use_container_width=True)
+
+    if kd_force:
+        st.session_state.pop("kd_decline_cached",None)
+        st.session_state.pop("kd_decline_cached_at",None)
+        try:
+            if KD_CACHE_PATH.exists(): KD_CACHE_PATH.unlink()
+        except Exception:
+            pass
+        kd_run=True
 
     if kd_run:
-        with st.spinner(f"正在計算約 {kd_scan_size} 檔候選的3K-2D…"):
-            _res = run_kd_scan_fast(all_stocks,kd_scan_size)
-            save_kd_cached_result(_res)
+        with st.spinner(f"重新取得歷史日K並計算約 {kd_scan_size} 檔…"):
+            try:
+                res=run_kd_scan_fast(all_stocks,kd_scan_size)
+                save_kd_cached_result(res)
+            except Exception as e:
+                st.error(f"3K-2D更新失敗：{e}")
 
-    kd_decline_ranking = load_kd_cached_result()
+    kd_decline_ranking=load_kd_cached_result()
+    st.caption("KD快取更新："+str(st.session_state.get("kd_decline_cached_at","尚未於本次工作階段更新")))
     if kd_decline_ranking is None or kd_decline_ranking.empty:
-        st.info("尚未有3K-2D快取結果，請按『🔎 掃描 3K-2D』。")
+        st.info("尚未有3K-2D結果，請按『🔎 掃描 3K-2D』。")
     else:
-        _kd=kd_decline_ranking.copy()
-        _kdshow=pd.DataFrame({
-            "股票":_kd["code"].astype(str).map(stock_label),
-            "3K-2D":pd.to_numeric(_kd["3K-2D"],errors="coerce"),
-            "K值":pd.to_numeric(_kd["K值"],errors="coerce"),
-            "D值":pd.to_numeric(_kd["D值"],errors="coerce"),
-            "連跌日數":pd.to_numeric(_kd["連跌日數"],errors="coerce"),
-            "連跌≥3日":pd.to_numeric(_kd["連跌日數"],errors="coerce").map(lambda x:"⭐ 是" if pd.notna(x) and x>=3 else "—"),
-            "KD狀態":_kd.get("KD狀態","—"),
-            "最新收盤":pd.to_numeric(_kd.get("最新收盤"),errors="coerce")
+        kd=attach_live_snapshot_to_kd(kd_decline_ranking,all_stocks)
+        show=pd.DataFrame({
+            "股票":kd["code"].astype(str).map(stock_label),
+            "3K-2D":pd.to_numeric(kd["3K-2D"],errors="coerce"),
+            "K值":pd.to_numeric(kd["K值"],errors="coerce"),
+            "D值":pd.to_numeric(kd["D值"],errors="coerce"),
+            "連跌日數":pd.to_numeric(kd["連跌日數"],errors="coerce"),
+            "連跌≥3日":pd.to_numeric(kd["連跌日數"],errors="coerce").map(lambda x:"⭐ 是" if pd.notna(x) and x>=3 else "—"),
+            "KD資料基準":kd["KD資料基準"],
+            "日K收盤":pd.to_numeric(kd["日K收盤"],errors="coerce"),
+            "盤中價格":pd.to_numeric(kd["盤中價格"],errors="coerce"),
+            "盤中漲跌幅(%)":pd.to_numeric(kd["盤中漲跌幅(%)"],errors="coerce")
         })
-        st.dataframe(_kdshow,width="stretch",hide_index=True)
+        st.dataframe(show,width="stretch",hide_index=True)
+        st.info("3K-2D／K／D／連跌日數＝完整日K；盤中價格只供即時比對，不會改寫正式KD。")
         c1,c2,c3,c4=st.columns(4)
-        c1.metric("負值股票數",len(_kd))
-        c2.metric("3K-2D≤-10",int((pd.to_numeric(_kd["3K-2D"],errors="coerce")<=-10).sum()))
-        c3.metric("連跌≥3日",int((pd.to_numeric(_kd["連跌日數"],errors="coerce")>=3).sum()))
-        c4.metric("連跌≥5日",int((pd.to_numeric(_kd["連跌日數"],errors="coerce")>=5).sum()))
+        c1.metric("負值股票數",len(kd))
+        c2.metric("3K-2D≤-10",int((pd.to_numeric(kd["3K-2D"],errors="coerce")<=-10).sum()))
+        c3.metric("連跌≥3日",int((pd.to_numeric(kd["連跌日數"],errors="coerce")>=3).sum()))
+        c4.metric("連跌≥5日",int((pd.to_numeric(kd["連跌日數"],errors="coerce")>=5).sum()))
 
 with TAB_VALIDATE:
     st.subheader("📊 推薦績效驗證｜1日・3日・5日")
@@ -2023,7 +2066,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.18.1 雙軌＋獨立事件雷達
+### V6.18.2 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -2066,8 +2109,8 @@ with TAB_SETTINGS:
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
 
 
-# ===== V6.18.1 籌碼評分說明 =====
-with st.expander("🏦 V6.18.1 法人／大戶籌碼評分", expanded=False):
+# ===== V6.18.2 籌碼評分說明 =====
+with st.expander("🏦 V6.18.2 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -2082,7 +2125,7 @@ with st.expander("🏦 V6.18.1 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.18.1 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.18.2 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -2091,17 +2134,17 @@ with st.expander("🧠 V6.18.1 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.18.1 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.18.2 過熱判斷說明", expanded=False):
     st.markdown("""
-V6.18.1 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
+V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
 
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.18.1 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.18.2 昨日推薦驗證說明", expanded=False):
     st.markdown("""
-系統從 V6.18.1 起每天保存推薦快照，下一個有資料的交易日自動比對：
+系統從 V6.18.2 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
 
 目前「今日符合值」定義為：**昨日推薦股中，今日相對昨日基準價上漲至少 2% 的比例**。
@@ -2109,12 +2152,12 @@ with st.expander("📊 V6.18.1 昨日推薦驗證說明", expanded=False):
 """)
 
 
-with st.expander("📊 V6.18.1 多日績效驗證說明", expanded=False):
+with st.expander("📊 V6.18.2 多日績效驗證說明", expanded=False):
     st.markdown("""
 ### 為什麼要看 1 / 3 / 5 日？
 單看隔日漲跌很容易錯判模型。例如事件股可能隔日整理，但第3～5日才真正反彈。
 
-因此 V6.18.1 同時追蹤：
+因此 V6.18.2 同時追蹤：
 - **1日報酬**
 - **3日報酬**
 - **5日報酬**
@@ -2127,7 +2170,7 @@ with st.expander("📊 V6.18.1 多日績效驗證說明", expanded=False):
 """)
 
 
-with st.expander("📉 V6.18.1 3K-2D弱勢雷達說明", expanded=False):
+with st.expander("📉 V6.18.2 3K-2D弱勢雷達說明", expanded=False):
     st.markdown("""
 ### 正式條件
 - **連續收盤下跌 ≥ 3 個交易日**
@@ -2145,9 +2188,9 @@ with st.expander("📉 V6.18.1 3K-2D弱勢雷達說明", expanded=False):
 若後續再搭配 **止跌、量縮、長下影、KD翻揚、法人回補或事件型承接**，才更適合觀察反彈機會。
 """)
 
-with st.expander("💾 V6.18.1 推薦歷史保存說明", expanded=False):
+with st.expander("💾 V6.18.2 推薦歷史保存說明", expanded=False):
     st.markdown("""
-V6.18.1 改為每天每檔保留**第一次正式推薦**，盤中刷新不覆寫原始分數與基準價，並同步寫入主檔與備援檔。
+V6.18.2 改為每天每檔保留**第一次正式推薦**，盤中刷新不覆寫原始分數與基準價，並同步寫入主檔與備援檔。
 
 注意：Streamlit Cloud 的執行磁碟不是永久資料庫。若重新部署，要真正延續舊歷史，需把既有的
 `recommendation_validation_history.csv` 一併保留在專案中；本版會自動合併主檔與備援檔並去重。

@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.18.1",
+  "version": "6.18.2",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -137,5 +137,7 @@
   "validation_backup_file": true,
   "lazy_kd_scan": true,
   "kd_prefilter_default": 350,
-  "lazy_validation": true
+  "lazy_validation": true,
+  "kd_completed_daily_only": true,
+  "kd_live_quote_separate": true
 }
