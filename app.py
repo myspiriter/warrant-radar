@@ -867,7 +867,10 @@ def event_reason_text(row):
 def market_summary_text(ranking, event_ranking):
     ranking = pd.DataFrame() if ranking is None else ranking
     event_ranking = pd.DataFrame() if event_ranking is None else event_ranking
-    scores = pd.to_numeric(ranking.get("score", pd.Series(dtype=float)), errors="coerce").dropna()
+    current = ranking.copy()
+    if not current.empty and "candidate_status" in current.columns:
+        current = current[~current["candidate_status"].isin(["前次高分保留","事件追蹤保留"])].copy()
+    scores = pd.to_numeric(current.get("score", pd.Series(dtype=float)), errors="coerce").dropna()
     es = pd.to_numeric(event_ranking.get("event_score", pd.Series(dtype=float)), errors="coerce").dropna()
     strong=int((scores>=80).sum()) if len(scores) else 0
     good=int(((scores>=70)&(scores<80)).sum()) if len(scores) else 0
@@ -1117,7 +1120,7 @@ def validation_summary(df, horizon_col):
 
 
 
-@st.cache_data(ttl=21600, show_spinner=False)
+@st.cache_data(ttl=1800, show_spinner=False)
 def load_bulk_kd_history():
     # 一次按交易日抓整個市場，取代逐檔 4 個月份 HTTP 請求。
     return twse_recent_market_history(calendar_days=35)
@@ -1170,8 +1173,24 @@ def save_kd_cached_result(df):
 
 def run_kd_scan_fast(all_stocks, max_candidates=None):
     hist_all=load_bulk_kd_history()
+    # 第一次若拿到空/不足資料，清掉批次快取後重試一次，避免空結果被卡住。
+    valid_codes = hist_all["code"].nunique() if (hist_all is not None and not hist_all.empty and "code" in hist_all.columns) else 0
+    valid_days = hist_all["date"].nunique() if (hist_all is not None and not hist_all.empty and "date" in hist_all.columns) else 0
+    if hist_all is None or hist_all.empty or valid_codes < 50 or valid_days < 12:
+        try:
+            load_bulk_kd_history.clear()
+        except Exception:
+            pass
+        hist_all=load_bulk_kd_history()
     records=[] if all_stocks is None or all_stocks.empty else all_stocks[["code","name"]].drop_duplicates("code").to_dict("records")
-    return build_kd_from_bulk_history(hist_all,records)
+    result=build_kd_from_bulk_history(hist_all,records)
+    diag={
+        "交易日數": int(hist_all["date"].nunique()) if (hist_all is not None and not hist_all.empty and "date" in hist_all.columns) else 0,
+        "歷史股票數": int(hist_all["code"].nunique()) if (hist_all is not None and not hist_all.empty and "code" in hist_all.columns) else 0,
+        "歷史筆數": int(len(hist_all)) if hist_all is not None else 0,
+        "負值股票數": int(len(result)) if result is not None else 0,
+    }
+    return result, diag
 
 def attach_live_snapshot_to_kd(kd_df, all_stocks):
     """正式KD使用完整日K；盤中行情只另欄顯示。"""
@@ -1535,14 +1554,32 @@ ranking["盤中判斷"] = ranking.apply(
 
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
+def current_recommended(df):
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x=df.copy()
+    score=pd.to_numeric(x.get("score"),errors="coerce").fillna(0)
+    setup=x.get("setup",pd.Series("",index=x.index)).astype(str)
+    status=x.get("candidate_status",pd.Series("本次正常",index=x.index)).astype(str)
+    return x[(score>=70) &
+             (~setup.isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"])) &
+             (~status.isin(["前次高分保留","事件追蹤保留"]))].copy()
+
+recommended_now = current_recommended(ranking)
+
 valid = ranking[pd.to_numeric(ranking["score"], errors="coerce").fillna(0) > 0].copy()
-c1.metric("今日候選", len(ranking))
+c1.metric("今日推薦", len(recommended_now))
 c2.metric("80分以上強力候選", int((pd.to_numeric(valid["score"], errors="coerce").fillna(0) >= 80).sum()))
 _event80 = int((pd.to_numeric(event_ranking["event_score"], errors="coerce").fillna(0) >= 80).sum()) if event_ranking is not None and not event_ranking.empty else 0
 c3.metric("80分以上事件機會", _event80)
 c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破型"]).sum()))
 
 st.markdown("### 🧭 今日市場分析")
+_current_rank = ranking.copy()
+if not _current_rank.empty and "candidate_status" in _current_rank.columns:
+    _current_rank = _current_rank[~_current_rank["candidate_status"].isin(["前次高分保留","事件追蹤保留"])].copy()
+_score70 = int((pd.to_numeric(_current_rank.get("score"), errors="coerce").fillna(0) >= 70).sum()) if not _current_rank.empty else 0
+st.caption(f"本次70分以上候選 {_score70} 檔；其中符合『今日推薦』完整條件 {len(recommended_now)} 檔。兩者不再混用。")
 st.info(market_summary_text(ranking, event_ranking))
 
 # V6.18.2 每日推薦驗證快照
@@ -1554,12 +1591,21 @@ TAB_TODAY, TAB_EVENT, TAB_OVERHEAT, TAB_KD, TAB_VALIDATE, TAB_NEXT, TAB_WATCH, T
 
 with TAB_TODAY:
     st.subheader("今日推薦")
-    recommended = ranking[
-        (pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 70) &
-        (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"])) &
-        (~ranking["candidate_status"].isin(["前次高分保留","事件追蹤保留"]))
-    ].copy()
+    recommended = recommended_now.copy()
 
+    with st.expander("🔎 推薦檔數診斷", expanded=False):
+        _tmp=ranking.copy()
+        if not _tmp.empty:
+            _tmp["score_num"]=pd.to_numeric(_tmp["score"],errors="coerce").fillna(0)
+            _tmp70=_tmp[_tmp["score_num"]>=70].copy()
+            st.write(f"70分以上共 {len(_tmp70)} 檔；正式今日推薦 {len(recommended)} 檔。")
+            if not _tmp70.empty:
+                _tmp70["排除原因"]=_tmp70.apply(lambda r: (
+                    "前次/事件追蹤保留" if str(r.get("candidate_status","")) in ["前次高分保留","事件追蹤保留"] else
+                    "訊號不適合追價" if str(r.get("setup","")) in ["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"] else
+                    "符合今日推薦"
+                ),axis=1)
+                st.dataframe(_tmp70[[c for c in ["code","name","score","setup","candidate_status","排除原因"] if c in _tmp70.columns]],width="stretch",hide_index=True)
     if recommended.empty:
         if ranking.empty:
             st.error("連保底候選池也無法建立。這代表股票市場日資料本身異常，不是『沒有投資標的』。")
@@ -1737,7 +1783,7 @@ with TAB_EVENT:
 
 with TAB_KD:
     st.subheader("📉 全市場 3K-2D 負值排行")
-    st.caption("V6.18.3：高速批次日K掃描。一次抓整體市場交易日資料，再於本機計算 3K-2D；盤中價格另外顯示。")
+    st.caption("V6.18.4：高速批次日K掃描。一次抓整體市場交易日資料，再於本機計算 3K-2D；盤中價格另外顯示。")
 
     k1,k2,k3=st.columns([2,1,1])
     with k1:
@@ -1758,6 +1804,11 @@ with TAB_KD:
             if KD_CACHE_PATH.exists(): KD_CACHE_PATH.unlink()
         except Exception:
             pass
+        try:
+            load_bulk_kd_history.clear()
+        except Exception:
+            pass
+        st.session_state.pop("kd_scan_diag", None)
         kd_run=True
 
     if kd_run:
@@ -1770,6 +1821,15 @@ with TAB_KD:
 
     kd_decline_ranking=load_kd_cached_result()
     st.caption("KD快取更新："+str(st.session_state.get("kd_decline_cached_at","尚未於本次工作階段更新")))
+    _diag = st.session_state.get("kd_scan_diag", {})
+    if _diag:
+        d1,d2,d3,d4=st.columns(4)
+        d1.metric("抓到交易日", _diag.get("交易日數",0))
+        d2.metric("歷史股票數", _diag.get("歷史股票數",0))
+        d3.metric("歷史資料筆數", _diag.get("歷史筆數",0))
+        d4.metric("3K-2D負值", _diag.get("負值股票數",0))
+        if _diag.get("交易日數",0) < 12 or _diag.get("歷史股票數",0) < 50:
+            st.warning("本次批次日K資料不完整；請按『♻️ 強制更新日K』。若仍不足，代表官方批次來源當下回傳受限。")
     if kd_decline_ranking is None or kd_decline_ranking.empty:
         st.info("尚未有3K-2D結果，請按『🔎 掃描 3K-2D』。")
     else:
@@ -2087,7 +2147,7 @@ st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能�
 
 
 # ===== V6.18.2 籌碼評分說明 =====
-with st.expander("🏦 V6.18.3 法人／大戶籌碼評分", expanded=False):
+with st.expander("🏦 V6.18.4 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -2102,7 +2162,7 @@ with st.expander("🏦 V6.18.3 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.18.3 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.18.4 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -2111,7 +2171,7 @@ with st.expander("🧠 V6.18.3 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.18.3 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.18.4 過熱判斷說明", expanded=False):
     st.markdown("""
 V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
@@ -2119,7 +2179,7 @@ V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交�
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.18.3 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.18.4 昨日推薦驗證說明", expanded=False):
     st.markdown("""
 系統從 V6.18.2 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
@@ -2147,7 +2207,7 @@ with st.expander("📊 V6.18.2 多日績效驗證說明", expanded=False):
 """)
 
 
-with st.expander("📉 V6.18.3 3K-2D弱勢雷達說明", expanded=False):
+with st.expander("📉 V6.18.4 3K-2D弱勢雷達說明", expanded=False):
     st.markdown("""
 ### 正式條件
 - **連續收盤下跌 ≥ 3 個交易日**
