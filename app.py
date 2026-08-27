@@ -541,7 +541,7 @@ def dynamic_ranking(pool: pd.DataFrame):
             rows.append({**base,"score":0,"setup":"資料錯誤","error":str(e),"history_source":"個股歷史失敗"})
             failed.append(code)
 
-    # V6.18.5：個股歷史失敗時，用全市場批次日K做第二層補算，避免直接變0分。
+    # V6.18.6：個股歷史失敗時，用全市場批次日K做第二層補算，避免直接變0分。
     if failed:
         try:
             bulk=load_bulk_kd_history()
@@ -1271,6 +1271,203 @@ def save_validation_cached_result(df):
         pass
 
 
+
+# ===== V6.18.6 3K-2D 多來源備援 =====
+KD_HISTORY_CACHE = Path("/tmp/warrant_radar_kd_history_v6186.csv")
+KD_HISTORY_META = Path("/tmp/warrant_radar_kd_history_v6186.json")
+
+def _normalize_hist_frame(h, code=None):
+    if h is None or h.empty:
+        return pd.DataFrame()
+    x = h.copy()
+    # normalize common column names
+    rename_map = {}
+    for c in x.columns:
+        lc = str(c).lower()
+        if lc in ["date","日期","trade_date"]: rename_map[c] = "date"
+        elif lc in ["open","開盤價","openingprice"]: rename_map[c] = "open"
+        elif lc in ["high","最高價","highestprice"]: rename_map[c] = "high"
+        elif lc in ["low","最低價","lowestprice"]: rename_map[c] = "low"
+        elif lc in ["close","收盤價","closingprice"]: rename_map[c] = "close"
+        elif lc in ["volume","成交股數","tradevolume"]: rename_map[c] = "volume"
+        elif lc in ["code","stockno","證券代號"]: rename_map[c] = "code"
+        elif lc in ["name","stockname","證券名稱"]: rename_map[c] = "name"
+    x = x.rename(columns=rename_map)
+    if "date" not in x.columns:
+        return pd.DataFrame()
+    if "code" not in x.columns and code is not None:
+        x["code"] = str(code)
+    keep = [c for c in ["date","code","name","open","high","low","close","volume"] if c in x.columns]
+    x = x[keep].copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    if "code" in x.columns:
+        x["code"] = x["code"].astype(str).str.strip()
+    for c in ["open","high","low","close","volume"]:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+    x = x.dropna(subset=["date"])
+    return x
+
+def _read_kd_history_cache(max_age_hours=6):
+    try:
+        if not KD_HISTORY_CACHE.exists() or not KD_HISTORY_META.exists():
+            return pd.DataFrame(), {}
+        meta = json.loads(KD_HISTORY_META.read_text(encoding="utf-8"))
+        ts = pd.to_datetime(meta.get("updated_at"), errors="coerce")
+        if pd.isna(ts) or (pd.Timestamp.now() - ts).total_seconds() > max_age_hours*3600:
+            return pd.DataFrame(), meta
+        x = pd.read_csv(KD_HISTORY_CACHE, dtype={"code":str})
+        x["date"] = pd.to_datetime(x["date"], errors="coerce")
+        return x, meta
+    except Exception:
+        return pd.DataFrame(), {}
+
+def _write_kd_history_cache(df, source_name, diagnostics):
+    try:
+        if df is None:
+            df = pd.DataFrame()
+        df.to_csv(KD_HISTORY_CACHE, index=False, encoding="utf-8-sig")
+        meta = {
+            "updated_at": pd.Timestamp.now().isoformat(),
+            "source": source_name,
+            **diagnostics
+        }
+        KD_HISTORY_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+def _bulk_history_from_existing_loader(all_stocks, lookback_days=45, max_codes=600):
+    """Fallback: use existing per-stock loader only for a capped liquid universe.
+    This is slower than true bulk, but reliable and bounded.
+    """
+    if all_stocks is None or all_stocks.empty:
+        return pd.DataFrame(), {"attempted":0,"success":0}
+
+    x = all_stocks.copy()
+    x["code"] = x["code"].astype(str).str.strip()
+    x = x[x["code"].str.fullmatch(r"\d{4}", na=False)].copy()
+
+    # prefer liquid stocks first
+    for c in ["turnover","volume_lots"]:
+        if c in x.columns:
+            x[c] = pd.to_numeric(x[c], errors="coerce")
+    if "turnover" in x.columns:
+        x = x.sort_values("turnover", ascending=False)
+    elif "volume_lots" in x.columns:
+        x = x.sort_values("volume_lots", ascending=False)
+
+    codes = x.head(max_codes)["code"].astype(str).tolist()
+    rows=[]
+    success=0
+    for code in codes:
+        try:
+            h = load_hist(code)
+            h = _normalize_hist_frame(h, code)
+            if not h.empty:
+                # only keep recent lookback trading window
+                h = h.sort_values("date").tail(max(35, lookback_days))
+                rows.append(h)
+                success += 1
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame(), {"attempted":len(codes),"success":0}
+    out = pd.concat(rows, ignore_index=True, sort=False)
+    return out, {"attempted":len(codes),"success":success}
+
+def get_kd_history_resilient(all_stocks, force=False, max_codes=600):
+    """Try cached bulk result first; if unavailable/empty, use bounded per-stock fallback.
+    Never cache an empty result as valid.
+    """
+    if force:
+        for p in [KD_HISTORY_CACHE, KD_HISTORY_META]:
+            try:
+                if p.exists(): p.unlink()
+            except Exception:
+                pass
+
+    cached, meta = _read_kd_history_cache(max_age_hours=6)
+    if not cached.empty:
+        diag = {
+            "source": meta.get("source","cache"),
+            "trade_days": int(cached["date"].nunique()) if "date" in cached else 0,
+            "stocks": int(cached["code"].nunique()) if "code" in cached else 0,
+            "rows": int(len(cached)),
+            "fallback_attempted": int(meta.get("fallback_attempted",0)),
+            "fallback_success": int(meta.get("fallback_success",0)),
+        }
+        return cached, diag
+
+    # First: if V6.18.3/4 provided a bulk function, try it dynamically.
+    bulk = pd.DataFrame()
+    bulk_source = ""
+    bulk_diag = {}
+    for fn_name in ["load_bulk_daily_history", "load_market_daily_history", "fetch_bulk_daily_history",
+                    "get_bulk_daily_history", "load_twse_bulk_history"]:
+        fn = globals().get(fn_name)
+        if callable(fn):
+            try:
+                candidate = fn()
+                if isinstance(candidate, tuple):
+                    candidate = candidate[0]
+                candidate = _normalize_hist_frame(candidate)
+                if not candidate.empty and "code" in candidate.columns:
+                    bulk = candidate
+                    bulk_source = fn_name
+                    break
+            except Exception:
+                continue
+
+    # Second: bounded reliable fallback.
+    fb_diag = {"attempted":0,"success":0}
+    if bulk.empty:
+        bulk, fb_diag = _bulk_history_from_existing_loader(all_stocks, max_codes=max_codes)
+        bulk_source = "個股歷史備援"
+
+    if bulk.empty:
+        return pd.DataFrame(), {
+            "source":"全部來源失敗","trade_days":0,"stocks":0,"rows":0,
+            "fallback_attempted":fb_diag.get("attempted",0),
+            "fallback_success":fb_diag.get("success",0),
+        }
+
+    diagnostics = {
+        "trade_days": int(bulk["date"].nunique()),
+        "stocks": int(bulk["code"].nunique()),
+        "rows": int(len(bulk)),
+        "fallback_attempted": fb_diag.get("attempted",0),
+        "fallback_success": fb_diag.get("success",0),
+    }
+    _write_kd_history_cache(bulk, bulk_source, diagnostics)
+    return bulk, {"source":bulk_source, **diagnostics}
+
+def build_3k2d_from_bulk_history(hist):
+    """Vectorized-ish per-code KD from prepared history."""
+    if hist is None or hist.empty or "code" not in hist.columns:
+        return pd.DataFrame()
+    rows=[]
+    for code, g in hist.groupby("code", sort=False):
+        try:
+            g = g.sort_values("date").copy()
+            if len(g) < 12:
+                continue
+            d = kd_decline_signal_v617(g)
+            if d.get("符合條件", False):
+                name = ""
+                if "name" in g.columns and g["name"].notna().any():
+                    name = str(g["name"].dropna().iloc[-1])
+                rows.append({"code":str(code),"name":name,**d})
+        except Exception:
+            continue
+    if not rows:
+        return pd.DataFrame()
+    out = pd.DataFrame(rows)
+    out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
+    out["連跌日數"] = pd.to_numeric(out["連跌日數"], errors="coerce").fillna(0)
+    out["K值"] = pd.to_numeric(out["K值"], errors="coerce")
+    return out.sort_values(["3K-2D","連跌日數","K值"], ascending=[True,False,True]).reset_index(drop=True)
+
+
 cfg = load_cfg()
 st.title("📡 個人版台股權證雷達 V6.18.2")
 st.caption("V6.18.2｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
@@ -1615,7 +1812,7 @@ _score70 = int((pd.to_numeric(_current_rank.get("score"), errors="coerce").filln
 st.caption(f"本次70分以上候選 {_score70} 檔；其中符合『今日推薦』完整條件 {len(recommended_now)} 檔。兩者不再混用。")
 _valid_scored = int((pd.to_numeric(_current_rank.get("score"),errors="coerce").fillna(0) > 0).sum()) if not _current_rank.empty else 0
 _failed_scored = max(0, len(_current_rank)-_valid_scored) if not _current_rank.empty else 0
-st.caption(f"評分資料健康：有效評分 {_valid_scored}/{len(_current_rank)} 檔｜資料不足/失敗 {_failed_scored} 檔。V6.18.5 會自動用批次日K補算失敗標的。")
+st.caption(f"評分資料健康：有效評分 {_valid_scored}/{len(_current_rank)} 檔｜資料不足/失敗 {_failed_scored} 檔。V6.18.6 會自動用批次日K補算失敗標的。")
 st.info(market_summary_text(ranking, event_ranking))
 
 # V6.18.2 每日推薦驗證快照
@@ -1819,77 +2016,71 @@ with TAB_EVENT:
 
 with TAB_KD:
     st.subheader("📉 全市場 3K-2D 負值排行")
-    st.caption("V6.18.5：高速批次日K掃描。一次抓整體市場交易日資料，再於本機計算 3K-2D；盤中價格另外顯示。")
+    st.caption("V6.18.6：批次來源失敗時自動切換個股歷史備援；空資料不再被當成有效快取。")
 
-    k1,k2,k3=st.columns([2,1,1])
+    k1,k2,k3 = st.columns([2,1,1])
     with k1:
-        st.metric("掃描模式","⚡ 全市場批次")
-        st.caption("不再逐檔下載歷史資料；日K快取 6 小時。")
+        kd_scan_size = st.slider(
+            "備援最多掃描檔數", 300, 900, 600, 100,
+            help="只有批次來源失敗時才使用；預設600檔兼顧涵蓋率與速度。"
+        )
     with k2:
         st.write(""); st.write("")
-        kd_run=st.button("🔎 高速掃描 3K-2D",use_container_width=True)
+        kd_run = st.button("🔎 高速掃描 3K-2D", use_container_width=True)
     with k3:
         st.write(""); st.write("")
-        kd_force=st.button("♻️ 強制更新日K",use_container_width=True)
+        kd_force = st.button("♻️ 強制重抓日K", use_container_width=True)
 
     if kd_force:
-        load_bulk_kd_history.clear()
-        st.session_state.pop("kd_decline_cached",None)
-        st.session_state.pop("kd_decline_cached_at",None)
-        try:
-            if KD_CACHE_PATH.exists(): KD_CACHE_PATH.unlink()
-        except Exception:
-            pass
-        try:
-            load_bulk_kd_history.clear()
-        except Exception:
-            pass
-        st.session_state.pop("kd_scan_diag", None)
-        kd_run=True
+        kd_run = True
 
     if kd_run:
-        with st.spinner("批次取得近期完整日K並計算全市場 3K-2D…"):
-            try:
-                res, diag = run_kd_scan_fast(all_stocks)
-                st.session_state["kd_scan_diag"] = diag
-                save_kd_cached_result(res)
-            except Exception as e:
-                st.error(f"3K-2D更新失敗：{e}")
+        with st.spinner("正在取得日K資料；若批次來源失敗會自動切換備援…"):
+            hist, diag = get_kd_history_resilient(all_stocks, force=kd_force, max_codes=kd_scan_size)
+            result = build_3k2d_from_bulk_history(hist)
+            st.session_state["kd6186_result"] = result
+            st.session_state["kd6186_diag"] = diag
+            st.session_state["kd6186_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    kd_decline_ranking=load_kd_cached_result()
-    st.caption("KD快取更新："+str(st.session_state.get("kd_decline_cached_at","尚未於本次工作階段更新")))
-    _diag = st.session_state.get("kd_scan_diag", {})
-    if _diag:
-        d1,d2,d3,d4=st.columns(4)
-        d1.metric("抓到交易日", _diag.get("交易日數",0))
-        d2.metric("歷史股票數", _diag.get("歷史股票數",0))
-        d3.metric("歷史資料筆數", _diag.get("歷史筆數",0))
-        d4.metric("3K-2D負值", _diag.get("負值股票數",0))
-        if _diag.get("交易日數",0) < 12 or _diag.get("歷史股票數",0) < 50:
-            st.warning("本次批次日K資料不完整；請按『♻️ 強制更新日K』。若仍不足，代表官方批次來源當下回傳受限。")
-    if kd_decline_ranking is None or kd_decline_ranking.empty:
-        st.info("尚未有3K-2D結果，請按『🔎 高速掃描 3K-2D』；若掃描後仍為0，請看上方資料診斷數字。")
+    result = st.session_state.get("kd6186_result", pd.DataFrame())
+    diag = st.session_state.get("kd6186_diag", {})
+    updated = st.session_state.get("kd6186_at", "尚未掃描")
+
+    st.caption(f"最後掃描：{updated}")
+
+    d1,d2,d3,d4,d5 = st.columns(5)
+    d1.metric("資料來源", str(diag.get("source","—")))
+    d2.metric("抓到交易日", int(diag.get("trade_days",0) or 0))
+    d3.metric("歷史股票數", int(diag.get("stocks",0) or 0))
+    d4.metric("歷史資料筆數", int(diag.get("rows",0) or 0))
+    d5.metric("3K-2D負值", 0 if result is None else len(result))
+
+    if diag.get("source") == "個股歷史備援":
+        st.info(
+            f"批次來源未取得資料，已自動改用個股歷史備援："
+            f"嘗試 {int(diag.get('fallback_attempted',0))} 檔，成功 {int(diag.get('fallback_success',0))} 檔。"
+        )
+
+    if result is None or result.empty:
+        if diag and int(diag.get("stocks",0) or 0) == 0:
+            st.error("目前所有日K來源都沒有取得有效資料。請按「♻️ 強制重抓日K」；若仍為0，代表資料源被限制，而不是3K-2D公式沒有股票。")
+        else:
+            st.info("已取得日K，但目前掃描範圍內沒有 3K-2D < 0 的股票。")
     else:
-        kd=attach_live_snapshot_to_kd(kd_decline_ranking,all_stocks)
-        show=pd.DataFrame({
-            "股票":kd["code"].astype(str).map(stock_label),
-            "3K-2D":pd.to_numeric(kd["3K-2D"],errors="coerce"),
-            "K值":pd.to_numeric(kd["K值"],errors="coerce"),
-            "D值":pd.to_numeric(kd["D值"],errors="coerce"),
-            "連跌日數":pd.to_numeric(kd["連跌日數"],errors="coerce"),
-            "連跌≥3日":pd.to_numeric(kd["連跌日數"],errors="coerce").map(lambda x:"⭐ 是" if pd.notna(x) and x>=3 else "—"),
-            "KD資料基準":kd["KD資料基準"],
-            "日K收盤":pd.to_numeric(kd["日K收盤"],errors="coerce"),
-            "盤中價格":pd.to_numeric(kd["盤中價格"],errors="coerce"),
-            "盤中漲跌幅(%)":pd.to_numeric(kd["盤中漲跌幅(%)"],errors="coerce")
+        kd = result.copy()
+        show = pd.DataFrame({
+            "股票": kd["code"].astype(str).map(stock_label),
+            "3K-2D": pd.to_numeric(kd["3K-2D"], errors="coerce"),
+            "K值": pd.to_numeric(kd["K值"], errors="coerce"),
+            "D值": pd.to_numeric(kd["D值"], errors="coerce"),
+            "連跌日數": pd.to_numeric(kd["連跌日數"], errors="coerce"),
+            "連跌≥3日": pd.to_numeric(kd["連跌日數"], errors="coerce").map(
+                lambda x: "⭐ 是" if pd.notna(x) and x >= 3 else "—"
+            ),
+            "KD狀態": kd.get("KD狀態","—"),
+            "日K收盤": pd.to_numeric(kd.get("最新收盤"), errors="coerce"),
         })
-        st.dataframe(show,width="stretch",hide_index=True)
-        st.info("3K-2D／K／D／連跌日數＝完整日K；盤中價格只供即時比對，不會改寫正式KD。")
-        c1,c2,c3,c4=st.columns(4)
-        c1.metric("負值股票數",len(kd))
-        c2.metric("3K-2D≤-10",int((pd.to_numeric(kd["3K-2D"],errors="coerce")<=-10).sum()))
-        c3.metric("連跌≥3日",int((pd.to_numeric(kd["連跌日數"],errors="coerce")>=3).sum()))
-        c4.metric("連跌≥5日",int((pd.to_numeric(kd["連跌日數"],errors="coerce")>=5).sum()))
+        st.dataframe(show, width="stretch", hide_index=True)
 
 with TAB_VALIDATE:
     st.subheader("📊 推薦績效驗證｜1日・3日・5日")
@@ -2184,7 +2375,7 @@ st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能�
 
 
 # ===== V6.18.2 籌碼評分說明 =====
-with st.expander("🏦 V6.18.5 法人／大戶籌碼評分", expanded=False):
+with st.expander("🏦 V6.18.6 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -2199,7 +2390,7 @@ with st.expander("🏦 V6.18.5 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.18.5 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.18.6 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -2208,7 +2399,7 @@ with st.expander("🧠 V6.18.5 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.18.5 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.18.6 過熱判斷說明", expanded=False):
     st.markdown("""
 V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
@@ -2216,7 +2407,7 @@ V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交�
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.18.5 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.18.6 昨日推薦驗證說明", expanded=False):
     st.markdown("""
 系統從 V6.18.2 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
@@ -2244,7 +2435,7 @@ with st.expander("📊 V6.18.2 多日績效驗證說明", expanded=False):
 """)
 
 
-with st.expander("📉 V6.18.5 3K-2D弱勢雷達說明", expanded=False):
+with st.expander("📉 V6.18.6 3K-2D弱勢雷達說明", expanded=False):
     st.markdown("""
 ### 正式條件
 - **連續收盤下跌 ≥ 3 個交易日**

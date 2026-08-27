@@ -32,7 +32,7 @@
   "max_deep_candidates": 60,
   "recommend_score_min": 70,
   "next_score_min": 55,
-  "version": "6.18.5",
+  "version": "6.18.6",
   "intraday_mode": true,
   "live_top_n": 10,
   "fallback_count": 30,
@@ -145,5 +145,8 @@
   "recommendation_count_consistency": true,
   "kd_tuple_unpack_fix": true,
   "ranking_bulk_history_fallback": true,
-  "summary_excludes_zero_scores": true
+  "summary_excludes_zero_scores": true,
+  "kd_multisource_fallback": true,
+  "kd_empty_cache_rejected": true,
+  "kd_fallback_default_codes": 600
 }
