@@ -190,8 +190,8 @@ def safe_arrow_df(df: pd.DataFrame) -> pd.DataFrame:
                     x[c] = s.map(lambda v: None if pd.isna(v) else str(v)).astype("string")
     return x
 
-def show_df(df, *args, **kwargs):
-    """統一安全顯示 DataFrame。"""
+def safe_st_dataframe(df, *args, **kwargs):
+    """統一安全顯示 DataFrame，避免與既有 show_df 變數撞名。"""
     return st.dataframe(safe_arrow_df(df), *args, **kwargs)
 
 
@@ -252,7 +252,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
 
     return x
 
-st.set_page_config(page_title="個人版權證雷達 V7.2.1", page_icon="📡", layout="wide")
+st.set_page_config(page_title="個人版權證雷達 V7.2.2", page_icon="📡", layout="wide")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -1288,8 +1288,8 @@ def build_unified_ai_ranking(base: pd.DataFrame, weights: dict) -> pd.DataFrame:
     return out.sort_values("AI總分",ascending=False).reset_index(drop=True)
 
 
-APP_VERSION = "V7.2.1"
-APP_BUILD = "Arrow序列化修正・交易日同步・KD修正・高速掃描版"
+APP_VERSION = "V7.2.2"
+APP_BUILD = "顯示函式撞名修正・Arrow序列化修正・交易日同步・KD修正・高速掃描版"
 
 cfg = load_cfg()
 st.title(f"📡 個人版台股權證雷達 {APP_VERSION}")
@@ -1443,7 +1443,7 @@ if scan_mode:
 
     if show_funnel:
         with st.expander("🔍 為什麼正式預篩會是 0？｜篩選漏斗", expanded=fallback_used):
-            show_df(funnel_df, width="stretch", hide_index=True)
+            safe_st_dataframe(funnel_df, width="stretch", hide_index=True)
             if not funnel_df.empty:
                 st.caption("最後一關若突然歸零，通常代表權證標的代號/成交量資料關聯或門檻造成，而不是全市場真的沒有股票。")
 else:
@@ -1665,7 +1665,7 @@ with TAB_AI:
         a4.metric("過熱警示",f"{int((ai_ranking['過熱度']>=85).sum())} 檔")
         a5.metric("模擬買進",f"{int((ai_ranking['AI動作']=='🟢 模擬買進').sum())} 檔")
         cols=["代號","股票","AI總分","原雷達分數","估計勝率%","報酬風險比","技術面","事件","籌碼／大戶代理","法人","大戶","過熱度","資料信心%","盤中漲跌幅%","AI動作"]
-        show_df(af[[c for c in cols if c in af.columns]],width="stretch",hide_index=True)
+        safe_st_dataframe(af[[c for c in cols if c in af.columns]],width="stretch",hide_index=True)
         with st.expander("AI 統一評分邏輯", expanded=False):
             st.markdown(f"""
 - 技術／趨勢：**{ai_w_tech}**
@@ -1700,7 +1700,7 @@ with TAB_AI_ACCOUNT:
         m3.metric("現金部位",f"NT$ {ai_capital-invested:,.0f}")
         m4.metric("模擬持倉",int((buys["模擬狀態"]=="模擬建倉").sum()))
         show=["代號","股票","AI總分","估計勝率%","報酬風險比","過熱度","建議部位%","模擬投入金額","模擬狀態"]
-        show_df(buys[[c for c in show if c in buys.columns]],width="stretch",hide_index=True)
+        safe_st_dataframe(buys[[c for c in show if c in buys.columns]],width="stretch",hide_index=True)
         st.caption("此為模型驗證用模擬帳戶，不會自動下單。")
 
 with TAB_AI_ERROR:
@@ -1719,7 +1719,7 @@ with TAB_AI_ERROR:
             if _ai_safe(r.get("AI總分"),0)>=75 and pd.notna(live) and live<=-4:
                 issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"高分但盤中明顯轉弱","修正建議":"等待止穩，不使用日線高分硬接跌勢"})
     if issues:
-        show_df(pd.DataFrame(issues).drop_duplicates(),width="stretch",hide_index=True)
+        safe_st_dataframe(pd.DataFrame(issues).drop_duplicates(),width="stretch",hide_index=True)
     else:
         st.success("目前沒有明顯的模型矛盾訊號。")
 
@@ -1742,7 +1742,7 @@ with TAB_TODAY:
     else:
         recommended = recommended.head(10).copy()
     show_df = zh_stock_table(recommended)
-    show_df(show_df, width="stretch", hide_index=True,
+    safe_st_dataframe(show_df, width="stretch", hide_index=True,
                  column_config={"機會分數":st.column_config.ProgressColumn("機會分數", min_value=0,max_value=100,format="%.1f")})
 
     top_codes = recommended[pd.to_numeric(recommended["score"], errors="coerce").fillna(0) > 0]["code"].astype(str).tolist() if ("score" in recommended.columns and "code" in recommended.columns) else []
@@ -1777,7 +1777,7 @@ with TAB_TODAY:
                 st.warning("上傳的權證資料中沒有這個標的。")
             else:
                 cols = ["warrant_code","warrant_name","issuer","price","volume","strike","expiry","days_to_expiry","otm_pct","delta","effective_leverage","spread_pct","iv","warrant_score","eligible","filter_reason"]
-                show_df(zh_warrant_table(wr[[c for c in cols if c in wr.columns]].head(5)), width="stretch", hide_index=True)
+                safe_st_dataframe(zh_warrant_table(wr[[c for c in cols if c in wr.columns]].head(5)), width="stretch", hide_index=True)
         else:
             st.warning("目前沒有完整權證條款資料。請在左側上傳券商匯出的權證 CSV，就能直接算出『最佳券商＋最佳權證』。TWSE 每日成交量資料已可自動抓取。")
 
@@ -1855,7 +1855,7 @@ with TAB_EVENT:
             if _c != "事件分數":
                 _eshow[_c] = _eshow[_c].where(pd.notna(_eshow[_c]), "—")
 
-        show_df(
+        safe_st_dataframe(
             _eshow,
             width="stretch",
             hide_index=True,
@@ -1930,7 +1930,7 @@ with TAB_KD:
             "資料日期": _kd["資料日期"] if "資料日期" in _kd.columns else "—",
             "最新收盤": _kd["最新收盤"],
         })
-        show_df(_kdshow, width="stretch", hide_index=True)
+        safe_st_dataframe(_kdshow, width="stretch", hide_index=True)
 
         total = len(_kd)
         negative10 = int((_kd["3K-2D"] <= -10).sum())
@@ -1999,7 +1999,7 @@ with TAB_VALIDATE:
                 "5日內最大回撤(%)": pd.to_numeric(_latest["5日內最大回撤(%)"] if "5日內最大回撤(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
                 "驗證結果": _latest.get("驗證結果","—")
             })
-            show_df(_show, width="stretch", hide_index=True)
+            safe_st_dataframe(_show, width="stretch", hide_index=True)
 
             st.markdown("### 📈 模型歷史驗證")
             _s1 = validation_summary(_mv, "1日報酬(%)")
@@ -2046,7 +2046,7 @@ with TAB_OVERHEAT:
             "RSI":_oh.get("RSI",pd.NA),"MA20乖離(%)":_oh.get("MA20乖離(%)",pd.NA),
             "量比":_oh.get("量比",pd.NA),"近5日漲幅(%)":_oh.get("近5日漲幅(%)",pd.NA),
             "近10日漲幅(%)":_oh.get("近10日漲幅(%)",pd.NA),"為什麼過熱":_oh["過熱原因"]})
-        show_df(_ohshow,width="stretch",hide_index=True)
+        safe_st_dataframe(_ohshow,width="stretch",hide_index=True)
         _ohcodes=_oh["code"].astype(str).tolist()
         _ohc=st.selectbox("查看過熱股票",_ohcodes,format_func=stock_label,key="overheat_stock")
         _ohr=_oh[_oh["code"].astype(str)==str(_ohc)].iloc[0]
@@ -2076,7 +2076,7 @@ with TAB_YDAY:
             yd_show = yd_show.rename(columns={"score":"昨日機會分數","setup":"昨日訊號類型","close":"昨日收盤價"})
             yd_show = yd_show[[c for c in ["股票","昨日機會分數","昨日訊號類型","昨日收盤價","至今變化(%)"] if c in yd_show.columns]]
             st.caption(f"訊號日期：{dates[1]}")
-            show_df(yd_show, width="stretch", hide_index=True)
+            safe_st_dataframe(yd_show, width="stretch", hide_index=True)
         else:
             st.info("目前只有今天的快照；明天再打開就會開始形成昨日績效。")
     else:
@@ -2098,13 +2098,13 @@ with TAB_NEXT:
             for _c in ["盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間"]:
                 if _c in _nshow.columns:
                     _nshow[_c] = _nshow[_c].where(pd.notna(_nshow[_c]), "等待盤中報價")
-            show_df(_nshow, width="stretch", hide_index=True)
+            safe_st_dataframe(_nshow, width="stretch", hide_index=True)
             st.caption("NEXT 不是立即買進訊號；代表條件正在接近，後續若量價/突破條件改善，可能進入今日推薦。")
 
 with TAB_WATCH:
     st.subheader("我的固定關注股")
     st.caption("這份清單不會因每日全市場排名而消失，可在左側自行修改。")
-    show_df(zh_stock_table(watch_ranking), width="stretch", hide_index=True)
+    safe_st_dataframe(zh_stock_table(watch_ranking), width="stretch", hide_index=True)
 
 with TAB_WARRANT:
     st.subheader("🎯 個股推薦前三名＋各自權證前五名")
@@ -2143,7 +2143,7 @@ with TAB_WARRANT:
         _top3 = _base_stock[_base_stock["code"].astype(str).isin(_selected_codes)].copy()
         _top3["_順序"] = _top3["code"].astype(str).map({c:i for i,c in enumerate(_selected_codes)})
         _top3 = _top3.sort_values("_順序").drop(columns=["_順序"], errors="ignore")
-        show_df(
+        safe_st_dataframe(
             zh_stock_table(_top3),
             width="stretch",
             hide_index=True,
@@ -2218,7 +2218,7 @@ with TAB_WARRANT:
                 ]
                 _show = _top5[[c for c in _cols if c in _top5.columns]]
 
-                show_df(
+                safe_st_dataframe(
                     zh_warrant_table(_show),
                     width="stretch",
                     hide_index=True
