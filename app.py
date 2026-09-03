@@ -10,11 +10,11 @@ import re
 import plotly.graph_objects as go
 import streamlit as st
 
-from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live, twse_recent_market_history
+from data_sources import twse_stock_history, twse_all_stock_daily, twse_warrant_basic, twse_warrant_daily_volume, merge_warrant_volume, twse_mis_quotes, infer_underlying_from_warrant_name, enrich_warrant_live
 from radar import stock_score, rank_warrants, normalize_warrant_columns, entry_plan, add_indicators
 from radar import kd_decline_signal_v617
 
-# V6.18.2：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
+# V6.17：避免 Streamlit/GitHub 檔案版本不同步造成整個 App ImportError。
 try:
     from radar import overheat_score_v614
 except ImportError:
@@ -161,6 +161,40 @@ COMPANY_NAMES = {
 }
 DYNAMIC_NAMES = {}
 
+def safe_arrow_df(df: pd.DataFrame) -> pd.DataFrame:
+    """V7.2.1：避免 Streamlit/PyArrow 因同欄混合數字、字串、pd.NA 而序列化失敗。"""
+    if df is None:
+        return pd.DataFrame()
+    x = df.copy()
+    for c in x.columns:
+        s = x[c]
+        # datetime 統一成可序列化字串
+        if pd.api.types.is_datetime64_any_dtype(s):
+            x[c] = s.dt.strftime("%Y-%m-%d %H:%M:%S").where(s.notna(), None)
+            continue
+
+        if s.dtype == "object":
+            nonnull = s.dropna()
+            if nonnull.empty:
+                x[c] = s.astype("string")
+                continue
+
+            # object 欄若混用多種 Python 型別，全部統一成字串，避免 ArrowTypeError
+            type_count = nonnull.map(lambda v: type(v).__name__).nunique()
+            if type_count > 1:
+                x[c] = s.map(lambda v: None if pd.isna(v) else str(v)).astype("string")
+            else:
+                # 特殊物件（Timestamp/date/list/dict 等）也改字串
+                sample = nonnull.iloc[0]
+                if isinstance(sample, (pd.Timestamp, list, dict, tuple, set)):
+                    x[c] = s.map(lambda v: None if pd.isna(v) else str(v)).astype("string")
+    return x
+
+def show_df(df, *args, **kwargs):
+    """統一安全顯示 DataFrame。"""
+    return st.dataframe(safe_arrow_df(df), *args, **kwargs)
+
+
 def stock_label(code: str) -> str:
     code=str(code)
     name=DYNAMIC_NAMES.get(code) or COMPANY_NAMES.get(code,"")
@@ -218,7 +252,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
 
     return x
 
-st.set_page_config(page_title="個人版權證雷達", page_icon="📡", layout="wide")
+st.set_page_config(page_title="個人版權證雷達 V7.2.1", page_icon="📡", layout="wide")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -515,59 +549,25 @@ def dynamic_ranking(pool: pd.DataFrame):
         "code","name","活躍權證數","現股成交量(張)","現股成交金額",
         "score","trend_score","event_score","score_mode","setup","close","ret1_pct","ret5_pct","ret20_pct",
         "volume_ratio","rsi14","ma20","breakout_quality","support","risk","consistency",
-        "data_confidence","score_reason","history_source"
+        "data_confidence","score_reason"
     ]
     if pool is None or pool.empty:
         return pd.DataFrame(columns=base_cols)
-
     rows=[]
-    failed=[]
     for _,r in pool.iterrows():
         code=str(r.get("code","")).strip()
         if not code:
             continue
-        base={"code":code,"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
-              "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0)}
         try:
             h=load_hist(code)
-            sc=stock_score(h)
-            row={**base, **(sc if isinstance(sc,dict) else {})}
-            row["history_source"]="個股歷史"
+            s=stock_score(h)
+            row={"code":code,"name":r.get("name",""),"活躍權證數":r.get("活躍權證數",0),
+                 "現股成交量(張)":r.get("volume_lots",0),"現股成交金額":r.get("turnover",0)}
+            if isinstance(s, dict):
+                row.update(s)
             rows.append(row)
-            score_num=pd.to_numeric(row.get("score"),errors="coerce")
-            if pd.isna(score_num) or score_num<=0 or str(row.get("setup","")) in ["資料錯誤","資料不足","資料待確認"]:
-                failed.append(code)
         except Exception as e:
-            rows.append({**base,"score":0,"setup":"資料錯誤","error":str(e),"history_source":"個股歷史失敗"})
-            failed.append(code)
-
-    # V6.18.6：個股歷史失敗時，用全市場批次日K做第二層補算，避免直接變0分。
-    if failed:
-        try:
-            bulk=load_bulk_kd_history()
-            if bulk is not None and not bulk.empty and "code" in bulk.columns:
-                bulk=bulk.copy(); bulk["code"]=bulk["code"].astype(str).str.strip()
-                bulk_map={c:g.sort_values("date") for c,g in bulk[bulk["code"].isin(failed)].groupby("code")}
-                for i,row in enumerate(rows):
-                    code=str(row.get("code",""))
-                    cur=pd.to_numeric(row.get("score"),errors="coerce")
-                    needs=(pd.isna(cur) or cur<=0 or str(row.get("setup","")) in ["資料錯誤","資料不足","資料待確認"])
-                    if not needs or code not in bulk_map:
-                        continue
-                    g=bulk_map[code]
-                    if len(g) < 22:
-                        continue
-                    try:
-                        sc=stock_score(g[[c for c in ["date","open","high","low","close","volume_lots"] if c in g.columns]].rename(columns={"volume_lots":"volume"}))
-                        # stock_score/add_indicators expects volume; keep both if needed
-                        if isinstance(sc,dict) and float(pd.to_numeric(sc.get("score"),errors="coerce") or 0)>0:
-                            rows[i].update(sc)
-                            rows[i]["history_source"]="批次日K補算"
-                    except Exception:
-                        pass
-        except Exception:
-            pass
-
+            rows.append({"code":code,"name":r.get("name",""),"score":0,"setup":"資料錯誤","error":str(e)})
     if not rows:
         return pd.DataFrame(columns=base_cols)
     out=pd.DataFrame(rows)
@@ -577,6 +577,7 @@ def dynamic_ranking(pool: pd.DataFrame):
     out["score"]=pd.to_numeric(out["score"],errors="coerce").fillna(0)
     out["setup"]=out["setup"].fillna("資料不足")
     return out.sort_values("score",ascending=False).reset_index(drop=True)
+
 
 
 def fallback_market_candidates(all_stocks: pd.DataFrame, max_rows: int = 30) -> pd.DataFrame:
@@ -794,7 +795,7 @@ def build_event_pool(all_stocks: pd.DataFrame,
                      min_stock_volume=1000,
                      min_turnover_m=50,
                      max_candidates=120):
-    """V6.18.2 獨立事件池：
+    """V6.17 獨立事件池：
     只要求現股流動性，不要求活躍權證數，避免事件股先被權證資料刷掉。
     """
     if all_stocks is None or all_stocks.empty:
@@ -869,7 +870,7 @@ def event_dynamic_ranking(event_pool: pd.DataFrame):
     out["event_score"] = pd.to_numeric(out["event_score"], errors="coerce").fillna(0)
     out["trend_score"] = pd.to_numeric(out["trend_score"], errors="coerce").fillna(0)
 
-    # V6.18.2：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
+    # V6.17：只要事件分 >= 60 就進事件雷達，不要求事件分比趨勢分高6分。
     out["事件等級"] = out["event_score"].map(event_grade)
     out = out[out["event_score"] >= 60].copy()
 
@@ -900,10 +901,7 @@ def event_reason_text(row):
 def market_summary_text(ranking, event_ranking):
     ranking = pd.DataFrame() if ranking is None else ranking
     event_ranking = pd.DataFrame() if event_ranking is None else event_ranking
-    current = ranking.copy()
-    if not current.empty and "candidate_status" in current.columns:
-        current = current[~current["candidate_status"].isin(["前次高分保留","事件追蹤保留"])].copy()
-    scores = pd.to_numeric(current.get("score", pd.Series(dtype=float)), errors="coerce").dropna()
+    scores = pd.to_numeric(ranking.get("score", pd.Series(dtype=float)), errors="coerce").dropna()
     es = pd.to_numeric(event_ranking.get("event_score", pd.Series(dtype=float)), errors="coerce").dropna()
     strong=int((scores>=80).sum()) if len(scores) else 0
     good=int(((scores>=70)&(scores<80)).sum()) if len(scores) else 0
@@ -954,49 +952,32 @@ def build_overheat_ranking(stock_pool, max_scan=120):
 
 
 VALIDATION_HISTORY_PATH = APP_DIR / "recommendation_validation_history.csv"
-VALIDATION_BACKUP_PATH = APP_DIR / "recommendation_validation_history_backup.csv"
-
-def load_validation_history_all():
-    frames=[]
-    for p in [VALIDATION_HISTORY_PATH, VALIDATION_BACKUP_PATH]:
-        try:
-            if p.exists():
-                x=pd.read_csv(p,dtype={"code":str})
-                if not x.empty: frames.append(x)
-        except Exception:
-            pass
-    if not frames: return pd.DataFrame()
-    x=pd.concat(frames,ignore_index=True,sort=False)
-    if "snapshot_date" in x.columns and "code" in x.columns:
-        x=x.drop_duplicates(["snapshot_date","code"],keep="first")
-    return x
 
 def save_recommendation_snapshot(ranking):
-    """每天每檔只保存第一次正式推薦，避免刷新覆寫原始推薦。"""
-    if ranking is None or ranking.empty: return
-    today=pd.Timestamp.today().strftime("%Y-%m-%d")
-    x=ranking.copy().head(20)
-    x["snapshot_date"]=today
-    x["code"]=x["code"].astype(str)
-    keep=[c for c in ["snapshot_date","code","name","score","close","setup","score_mode","event_score"] if c in x.columns]
-    x=x[keep]
+    """每日保留一次推薦快照，供下一交易日驗證。"""
+    if ranking is None or ranking.empty:
+        return
+    today = pd.Timestamp.today().strftime("%Y-%m-%d")
+    x = ranking.copy().head(20)
+    x["snapshot_date"] = today
+    x["code"] = x["code"].astype(str)
+    keep = [c for c in ["snapshot_date","code","name","score","close","setup","score_mode"] if c in x.columns]
+    x = x[keep]
     try:
-        old=load_validation_history_all()
-        if not old.empty:
-            existing=set(zip(old["snapshot_date"].astype(str),old["code"].astype(str)))
-            x=x.loc[[(today,str(c)) not in existing for c in x["code"]]]
-            merged=pd.concat([old,x],ignore_index=True,sort=False)
-        else:
-            merged=x
-        merged=merged.drop_duplicates(["snapshot_date","code"],keep="first")
-        merged.to_csv(VALIDATION_HISTORY_PATH,index=False,encoding="utf-8-sig")
-        merged.to_csv(VALIDATION_BACKUP_PATH,index=False,encoding="utf-8-sig")
+        if VALIDATION_HISTORY_PATH.exists():
+            old=pd.read_csv(VALIDATION_HISTORY_PATH,dtype={"code":str})
+            # 同一天刷新只保留最新快照
+            old=old[old["snapshot_date"].astype(str)!=today]
+            x=pd.concat([old,x],ignore_index=True,sort=False)
+        x.to_csv(VALIDATION_HISTORY_PATH,index=False,encoding="utf-8-sig")
     except Exception:
         pass
 
 def load_previous_recommendation_snapshot():
     try:
-        x=load_validation_history_all()
+        if not VALIDATION_HISTORY_PATH.exists():
+            return pd.DataFrame(), None
+        x=pd.read_csv(VALIDATION_HISTORY_PATH,dtype={"code":str})
         if x.empty or "snapshot_date" not in x.columns:
             return pd.DataFrame(), None
         today=pd.Timestamp.today().strftime("%Y-%m-%d")
@@ -1153,324 +1134,166 @@ def validation_summary(df, horizon_col):
 
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def kd_decline_for_code(code):
+    try:
+        return kd_decline_signal_v617(load_hist(str(code)))
+    except Exception:
+        return {
+            "連跌日數":0, "K值":pd.NA, "D值":pd.NA, "3K-2D":pd.NA,
+            "KD狀態":"⚪ 資料錯誤", "符合條件":False, "KD超賣":False,
+            "最新收盤":pd.NA
+        }
+
 @st.cache_data(ttl=1800, show_spinner=False)
-def load_bulk_kd_history():
-    # 一次按交易日抓整個市場，取代逐檔 4 個月份 HTTP 請求。
-    return twse_recent_market_history(calendar_days=35)
-
-def build_kd_from_bulk_history(hist_all, stock_records=None):
-    if hist_all is None or hist_all.empty:
-        return pd.DataFrame()
-    names = {}
-    if stock_records:
-        names = {str(r.get("code","")).strip(): r.get("name","") for r in stock_records}
-    rows=[]
-    for code,g in hist_all.groupby("code", sort=False):
-        code=str(code).strip()
-        if not re.fullmatch(r"\d{4}",code):
+def build_kd_decline_ranking(stock_records, expected_trade_date=""):
+    rows = []
+    for rr in stock_records:
+        code = str(rr.get("code","")).strip()
+        if not code or not re.fullmatch(r"\d{4}", code):
             continue
-        d=kd_decline_signal_v617(g[["date","open","high","low","close"]].copy())
-        if d.get("符合條件",False):
-            rows.append({"code":code,"name":names.get(code, g["name"].iloc[-1] if "name" in g else ""),**d})
+        d = kd_decline_for_code(code)
+        data_date = str(d.get("資料日期","") or "")
+        # 資料日期不等於本次市場最新交易日：直接排除，避免舊資料誤判連跌
+        if expected_trade_date and data_date and data_date != expected_trade_date:
+            continue
+        if d.get("符合條件", False):
+            rows.append({"code":code, "name":rr.get("name",""), **d})
+
     if not rows:
         return pd.DataFrame()
-    out=pd.DataFrame(rows)
-    for c in ["連跌日數","K值","D值","3K-2D"]:
-        out[c]=pd.to_numeric(out[c],errors="coerce")
-    out["連跌3日加強"]=out["連跌日數"].fillna(0)>=3
-    return out.sort_values(["3K-2D","連跌日數","K值"],ascending=[True,False,True]).reset_index(drop=True)
 
-KD_CACHE_PATH = Path("/tmp/warrant_radar_kd_cache.csv")
-VALIDATION_CACHE_PATH = Path("/tmp/warrant_radar_validation_cache.csv")
-
-def load_kd_cached_result():
-    x = st.session_state.get("kd_decline_cached")
-    if isinstance(x, pd.DataFrame):
-        return x
-    try:
-        if KD_CACHE_PATH.exists():
-            x = pd.read_csv(KD_CACHE_PATH, dtype={"code":str})
-            st.session_state["kd_decline_cached"] = x
-            return x
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def save_kd_cached_result(df):
-    st.session_state["kd_decline_cached"] = df if df is not None else pd.DataFrame()
-    st.session_state["kd_decline_cached_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        st.session_state["kd_decline_cached"].to_csv(KD_CACHE_PATH,index=False,encoding="utf-8-sig")
-    except Exception:
-        pass
-
-def run_kd_scan_fast(all_stocks, max_candidates=None):
-    hist_all=load_bulk_kd_history()
-    # 第一次若拿到空/不足資料，清掉批次快取後重試一次，避免空結果被卡住。
-    valid_codes = hist_all["code"].nunique() if (hist_all is not None and not hist_all.empty and "code" in hist_all.columns) else 0
-    valid_days = hist_all["date"].nunique() if (hist_all is not None and not hist_all.empty and "date" in hist_all.columns) else 0
-    if hist_all is None or hist_all.empty or valid_codes < 50 or valid_days < 12:
-        try:
-            load_bulk_kd_history.clear()
-        except Exception:
-            pass
-        hist_all=load_bulk_kd_history()
-    records=[] if all_stocks is None or all_stocks.empty else all_stocks[["code","name"]].drop_duplicates("code").to_dict("records")
-    result=build_kd_from_bulk_history(hist_all,records)
-    diag={
-        "交易日數": int(hist_all["date"].nunique()) if (hist_all is not None and not hist_all.empty and "date" in hist_all.columns) else 0,
-        "歷史股票數": int(hist_all["code"].nunique()) if (hist_all is not None and not hist_all.empty and "code" in hist_all.columns) else 0,
-        "歷史筆數": int(len(hist_all)) if hist_all is not None else 0,
-        "負值股票數": int(len(result)) if result is not None else 0,
-    }
-    return result, diag
-
-def attach_live_snapshot_to_kd(kd_df, all_stocks):
-    """正式KD使用完整日K；盤中行情只另欄顯示。"""
-    if kd_df is None or kd_df.empty:
-        return pd.DataFrame()
-    out=kd_df.copy()
-    out["code"]=out["code"].astype(str).str.strip()
-    out["日K收盤"]=pd.to_numeric(out.get("最新收盤"),errors="coerce")
-    out["盤中價格"]=pd.NA
-    out["盤中漲跌幅(%)"]=pd.NA
-    if all_stocks is not None and not all_stocks.empty:
-        live=all_stocks.copy()
-        live["code"]=live["code"].astype(str).str.strip()
-        price_col="close" if "close" in live.columns else None
-        pct_col="change_pct" if "change_pct" in live.columns else ("change" if "change" in live.columns else None)
-        cols=["code"]+([price_col] if price_col else [])+([pct_col] if pct_col else [])
-        live=live[cols].drop_duplicates("code",keep="last")
-        ren={}
-        if price_col: ren[price_col]="_live_price"
-        if pct_col: ren[pct_col]="_live_pct"
-        out=out.merge(live.rename(columns=ren),on="code",how="left")
-        if "_live_price" in out: out["盤中價格"]=pd.to_numeric(out["_live_price"],errors="coerce")
-        if "_live_pct" in out: out["盤中漲跌幅(%)"]=pd.to_numeric(out["_live_pct"],errors="coerce")
-    out["KD資料基準"]="完整日K"
-    return out
-
-def load_validation_cached_result():
-    x = st.session_state.get("validation_cached")
-    if isinstance(x,pd.DataFrame):
-        return x
-    try:
-        if VALIDATION_CACHE_PATH.exists():
-            x = pd.read_csv(VALIDATION_CACHE_PATH,dtype={"code":str})
-            st.session_state["validation_cached"] = x
-            return x
-    except Exception:
-        pass
-    return pd.DataFrame()
-
-def save_validation_cached_result(df):
-    st.session_state["validation_cached"] = df if df is not None else pd.DataFrame()
-    try:
-        st.session_state["validation_cached"].to_csv(VALIDATION_CACHE_PATH,index=False,encoding="utf-8-sig")
-    except Exception:
-        pass
-
-
-
-# ===== V6.18.6 3K-2D 多來源備援 =====
-KD_HISTORY_CACHE = Path("/tmp/warrant_radar_kd_history_v6186.csv")
-KD_HISTORY_META = Path("/tmp/warrant_radar_kd_history_v6186.json")
-
-def _normalize_hist_frame(h, code=None):
-    if h is None or h.empty:
-        return pd.DataFrame()
-    x = h.copy()
-    # normalize common column names
-    rename_map = {}
-    for c in x.columns:
-        lc = str(c).lower()
-        if lc in ["date","日期","trade_date"]: rename_map[c] = "date"
-        elif lc in ["open","開盤價","openingprice"]: rename_map[c] = "open"
-        elif lc in ["high","最高價","highestprice"]: rename_map[c] = "high"
-        elif lc in ["low","最低價","lowestprice"]: rename_map[c] = "low"
-        elif lc in ["close","收盤價","closingprice"]: rename_map[c] = "close"
-        elif lc in ["volume","成交股數","tradevolume"]: rename_map[c] = "volume"
-        elif lc in ["code","stockno","證券代號"]: rename_map[c] = "code"
-        elif lc in ["name","stockname","證券名稱"]: rename_map[c] = "name"
-    x = x.rename(columns=rename_map)
-    if "date" not in x.columns:
-        return pd.DataFrame()
-    if "code" not in x.columns and code is not None:
-        x["code"] = str(code)
-    keep = [c for c in ["date","code","name","open","high","low","close","volume"] if c in x.columns]
-    x = x[keep].copy()
-    x["date"] = pd.to_datetime(x["date"], errors="coerce")
-    if "code" in x.columns:
-        x["code"] = x["code"].astype(str).str.strip()
-    for c in ["open","high","low","close","volume"]:
-        if c in x.columns:
-            x[c] = pd.to_numeric(x[c], errors="coerce")
-    x = x.dropna(subset=["date"])
-    return x
-
-def _read_kd_history_cache(max_age_hours=6):
-    try:
-        if not KD_HISTORY_CACHE.exists() or not KD_HISTORY_META.exists():
-            return pd.DataFrame(), {}
-        meta = json.loads(KD_HISTORY_META.read_text(encoding="utf-8"))
-        ts = pd.to_datetime(meta.get("updated_at"), errors="coerce")
-        if pd.isna(ts) or (pd.Timestamp.now() - ts).total_seconds() > max_age_hours*3600:
-            return pd.DataFrame(), meta
-        x = pd.read_csv(KD_HISTORY_CACHE, dtype={"code":str})
-        x["date"] = pd.to_datetime(x["date"], errors="coerce")
-        return x, meta
-    except Exception:
-        return pd.DataFrame(), {}
-
-def _write_kd_history_cache(df, source_name, diagnostics):
-    try:
-        if df is None:
-            df = pd.DataFrame()
-        df.to_csv(KD_HISTORY_CACHE, index=False, encoding="utf-8-sig")
-        meta = {
-            "updated_at": pd.Timestamp.now().isoformat(),
-            "source": source_name,
-            **diagnostics
-        }
-        KD_HISTORY_META.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-def _bulk_history_from_existing_loader(all_stocks, lookback_days=45, max_codes=600):
-    """Fallback: use existing per-stock loader only for a capped liquid universe.
-    This is slower than true bulk, but reliable and bounded.
-    """
-    if all_stocks is None or all_stocks.empty:
-        return pd.DataFrame(), {"attempted":0,"success":0}
-
-    x = all_stocks.copy()
-    x["code"] = x["code"].astype(str).str.strip()
-    x = x[x["code"].str.fullmatch(r"\d{4}", na=False)].copy()
-
-    # prefer liquid stocks first
-    for c in ["turnover","volume_lots"]:
-        if c in x.columns:
-            x[c] = pd.to_numeric(x[c], errors="coerce")
-    if "turnover" in x.columns:
-        x = x.sort_values("turnover", ascending=False)
-    elif "volume_lots" in x.columns:
-        x = x.sort_values("volume_lots", ascending=False)
-
-    codes = x.head(max_codes)["code"].astype(str).tolist()
-    rows=[]
-    success=0
-    for code in codes:
-        try:
-            h = load_hist(code)
-            h = _normalize_hist_frame(h, code)
-            if not h.empty:
-                # only keep recent lookback trading window
-                h = h.sort_values("date").tail(max(35, lookback_days))
-                rows.append(h)
-                success += 1
-        except Exception:
-            continue
-    if not rows:
-        return pd.DataFrame(), {"attempted":len(codes),"success":0}
-    out = pd.concat(rows, ignore_index=True, sort=False)
-    return out, {"attempted":len(codes),"success":success}
-
-def get_kd_history_resilient(all_stocks, force=False, max_codes=600):
-    """Try cached bulk result first; if unavailable/empty, use bounded per-stock fallback.
-    Never cache an empty result as valid.
-    """
-    if force:
-        for p in [KD_HISTORY_CACHE, KD_HISTORY_META]:
-            try:
-                if p.exists(): p.unlink()
-            except Exception:
-                pass
-
-    cached, meta = _read_kd_history_cache(max_age_hours=6)
-    if not cached.empty:
-        diag = {
-            "source": meta.get("source","cache"),
-            "trade_days": int(cached["date"].nunique()) if "date" in cached else 0,
-            "stocks": int(cached["code"].nunique()) if "code" in cached else 0,
-            "rows": int(len(cached)),
-            "fallback_attempted": int(meta.get("fallback_attempted",0)),
-            "fallback_success": int(meta.get("fallback_success",0)),
-        }
-        return cached, diag
-
-    # First: if V6.18.3/4 provided a bulk function, try it dynamically.
-    bulk = pd.DataFrame()
-    bulk_source = ""
-    bulk_diag = {}
-    for fn_name in ["load_bulk_daily_history", "load_market_daily_history", "fetch_bulk_daily_history",
-                    "get_bulk_daily_history", "load_twse_bulk_history"]:
-        fn = globals().get(fn_name)
-        if callable(fn):
-            try:
-                candidate = fn()
-                if isinstance(candidate, tuple):
-                    candidate = candidate[0]
-                candidate = _normalize_hist_frame(candidate)
-                if not candidate.empty and "code" in candidate.columns:
-                    bulk = candidate
-                    bulk_source = fn_name
-                    break
-            except Exception:
-                continue
-
-    # Second: bounded reliable fallback.
-    fb_diag = {"attempted":0,"success":0}
-    if bulk.empty:
-        bulk, fb_diag = _bulk_history_from_existing_loader(all_stocks, max_codes=max_codes)
-        bulk_source = "個股歷史備援"
-
-    if bulk.empty:
-        return pd.DataFrame(), {
-            "source":"全部來源失敗","trade_days":0,"stocks":0,"rows":0,
-            "fallback_attempted":fb_diag.get("attempted",0),
-            "fallback_success":fb_diag.get("success",0),
-        }
-
-    diagnostics = {
-        "trade_days": int(bulk["date"].nunique()),
-        "stocks": int(bulk["code"].nunique()),
-        "rows": int(len(bulk)),
-        "fallback_attempted": fb_diag.get("attempted",0),
-        "fallback_success": fb_diag.get("success",0),
-    }
-    _write_kd_history_cache(bulk, bulk_source, diagnostics)
-    return bulk, {"source":bulk_source, **diagnostics}
-
-def build_3k2d_from_bulk_history(hist):
-    """Vectorized-ish per-code KD from prepared history."""
-    if hist is None or hist.empty or "code" not in hist.columns:
-        return pd.DataFrame()
-    rows=[]
-    for code, g in hist.groupby("code", sort=False):
-        try:
-            g = g.sort_values("date").copy()
-            if len(g) < 12:
-                continue
-            d = kd_decline_signal_v617(g)
-            if d.get("符合條件", False):
-                name = ""
-                if "name" in g.columns and g["name"].notna().any():
-                    name = str(g["name"].dropna().iloc[-1])
-                rows.append({"code":str(code),"name":name,**d})
-        except Exception:
-            continue
-    if not rows:
-        return pd.DataFrame()
     out = pd.DataFrame(rows)
-    out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
     out["連跌日數"] = pd.to_numeric(out["連跌日數"], errors="coerce").fillna(0)
     out["K值"] = pd.to_numeric(out["K值"], errors="coerce")
-    return out.sort_values(["3K-2D","連跌日數","K值"], ascending=[True,False,True]).reset_index(drop=True)
+    out["D值"] = pd.to_numeric(out["D值"], errors="coerce")
+    out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
 
+    # 越負、連跌越久、K值越低，排序越前
+    out["弱勢排序分"] = (
+        out["連跌日數"].clip(upper=10) * 10
+        + (-out["3K-2D"].clip(upper=0)).fillna(0) * 3
+        + (20 - out["K值"].clip(lower=0, upper=20)).fillna(0)
+    )
+
+    return out.sort_values(
+        ["KD超賣","弱勢排序分","連跌日數"],
+        ascending=[False,False,False]
+    ).reset_index(drop=True)
+
+
+def _ai_safe(v, default=0.0):
+    try:
+        return default if pd.isna(v) else float(v)
+    except Exception:
+        return default
+
+
+def _ai_chip_proxy(code: str):
+    """Use the SAME real price/volume history as the warrant radar; never fabricate institutional data."""
+    try:
+        ce = chip_event_for_code(str(code))
+    except Exception:
+        ce = {}
+    event = str(ce.get("籌碼事件", "⚪ 無法確認"))
+    conf = _ai_safe(ce.get("判斷信心", 0), 0)
+    if "倒貨" in event:
+        base = 18
+    elif "吸籌" in event:
+        base = 82
+    elif "洗盤後承接" in event:
+        base = 78
+    elif "換手" in event:
+        base = 62
+    else:
+        base = 50
+    # Low-confidence recognition shrinks toward neutral 50.
+    proxy = 50 + (base - 50) * min(1.0, conf / 70.0)
+    return round(max(0, min(100, proxy)), 1), ce
+
+
+def _ai_rr(score, data_conf=100):
+    s = _ai_safe(score, 0)
+    conf = _ai_safe(data_conf, 70)
+    win = max(40, min(78, 45 + (s-50)*0.42 + (conf-70)*0.08))
+    gain = max(1.5, (s-50)*0.18)
+    loss = max(1.5, 5.2 - (s-50)*0.045)
+    return round(win,1), round(gain,1), round(loss,1), round(gain/loss,2)
+
+
+def build_unified_ai_ranking(base: pd.DataFrame, weights: dict) -> pd.DataFrame:
+    if base is None or base.empty:
+        return pd.DataFrame()
+    rows=[]
+    for _, r in base.iterrows():
+        code=str(r.get("code", "")).strip()
+        if not code:
+            continue
+        tech = _ai_safe(r.get("trend_score", r.get("score", 0)), 0)
+        event = _ai_safe(r.get("event_score", 0), 0)
+        # momentum + breakout are native V6 model factors, normalized to 0-100
+        mom = _ai_safe(r.get("momentum", 0), 0) / 12 * 50 + _ai_safe(r.get("breakout_quality",0),0) / 12 * 50
+        mom = max(0,min(100,mom))
+        chip, ce = _ai_chip_proxy(code)
+        try:
+            oh = overheat_for_code(code)
+        except Exception:
+            oh = {}
+        heat = _ai_safe(oh.get("過熱分數", 0), 0)
+        risk_control = max(0, 100-heat)
+        vals={"tech":tech,"event":event,"chip":chip,"momentum":mom,"risk":risk_control}
+        wsum=sum(max(0,float(weights.get(k,0))) for k in vals)
+        ai_score=sum(vals[k]*max(0,float(weights.get(k,0))) for k in vals)/(wsum or 1)
+        # Keep the original radar score as a stability anchor; both views now come from one data core.
+        base_score=_ai_safe(r.get("score",0),0)
+        ai_score=ai_score*0.78 + base_score*0.22
+        data_conf=_ai_safe(r.get("data_confidence",100),70)
+        ai_score = max(0,min(100, ai_score))
+        win,gain,loss,rr=_ai_rr(ai_score,data_conf)
+        if heat >= 88:
+            action="🔴 過熱避開"
+        elif ai_score >= 82 and win >= 58 and data_conf >= 65:
+            action="🟢 模擬買進"
+        elif ai_score >= 70:
+            action="🟡 重點觀察"
+        elif ai_score >= 58:
+            action="🟠 一般觀察"
+        else:
+            action="⚪ 暫不操作"
+        live_pct=pd.to_numeric(r.get("change_pct_live"),errors="coerce")
+        rows.append({
+            "代號":code,"股票":stock_label(code),"AI總分":round(ai_score,1),
+            "原雷達分數":round(base_score,1),"技術面":round(tech,1),"事件":round(event,1),
+            "籌碼／大戶代理":round(chip,1),"法人": "待法人資料源" ,"大戶":str(ce.get("籌碼事件","⚪ 無法確認")),
+            "動能／突破":round(mom,1),"過熱度":round(heat,1),"反轉風險":_ai_safe(oh.get("反轉風險",0),0),
+            "估計勝率%":win,"預期上漲%":gain,"預期風險%":loss,"報酬風險比":rr,
+            "資料信心%":round(data_conf,1),"AI動作":action,"盤中漲跌幅%":live_pct,
+            "籌碼事件判定":str(ce.get("籌碼事件","⚪ 無法確認")),
+            "籌碼事件原因":str(ce.get("判斷原因","—")),
+            "事件型機會原因":event_reason_text(r.to_dict()) if 'event_reason_text' in globals() else str(r.get("score_reason","—")),
+            "3K-2D":np.nan,"連跌天數":np.nan,
+        })
+    out=pd.DataFrame(rows)
+    if out.empty:
+        return out
+    # Merge the already-computed REAL 3K-2D radar so the AI page and legacy page cannot disagree.
+    try:
+        if kd_decline_ranking is not None and not kd_decline_ranking.empty:
+            k=kd_decline_ranking.copy()
+            k["代號"]=k["code"].astype(str)
+            keep=[c for c in ["代號","3K-2D","連跌天數"] if c in k.columns]
+            out=out.drop(columns=[c for c in ["3K-2D","連跌天數"] if c in out.columns]).merge(k[keep].drop_duplicates("代號"),on="代號",how="left")
+    except Exception:
+        pass
+    return out.sort_values("AI總分",ascending=False).reset_index(drop=True)
+
+
+APP_VERSION = "V7.2.1"
+APP_BUILD = "Arrow序列化修正・交易日同步・KD修正・高速掃描版"
 
 cfg = load_cfg()
-st.title("📡 個人版台股權證雷達 V6.18.2")
-st.caption("V6.18.2｜已加入模組版本不同步保護，避免單一功能匯入失敗造成整個 App 無法啟動。")
+st.title(f"📡 個人版台股權證雷達 {APP_VERSION}")
+st.caption(f"{APP_VERSION}｜{APP_BUILD}")
 st.caption("全市場策略掃描 → 資料健康檢查 → 盤中行情覆蓋 → 今日推薦 → 最佳權證。策略底稿使用 TWSE 公開資料；盤中行情以 TWSE 市況資訊做最佳努力覆蓋，仍請下單前以券商報價確認。")
 
 # 先抓市場與權證資料，建立每日動態股票池
@@ -1490,6 +1313,13 @@ if not all_stocks.empty:
         market_mode = str(all_stocks["source_mode"].dropna().iloc[0])
     if "fetched_at" in all_stocks.columns and all_stocks["fetched_at"].notna().any():
         market_fetched_at = str(all_stocks["fetched_at"].dropna().iloc[0])
+
+# V7.2：統一最新交易日，過期備援不得進入「連跌」排行
+EXPECTED_TRADE_DATE = ""
+if not all_stocks.empty and "trade_date" in all_stocks.columns:
+    _td = pd.to_datetime(all_stocks["trade_date"], errors="coerce").dropna()
+    if not _td.empty:
+        EXPECTED_TRADE_DATE = _td.max().date().isoformat()
 
 if not all_stocks.empty:
     for _, r in all_stocks[["code","name"]].dropna().iterrows():
@@ -1566,6 +1396,19 @@ with st.sidebar:
     cfg["min_warrant_volume"]=min_vol; cfg["min_days_to_expiry"]=min_dte; cfg["max_otm_pct"]=max_otm
 
     st.divider()
+    st.header("🤖 AI 統一評分")
+    ai_min_score = st.slider("AI 最低觀察分數", 0, 100, 65, step=1)
+    ai_max_heat = st.slider("AI 最高過熱度", 0, 100, 85, step=1)
+    ai_capital = st.number_input("AI 模擬帳戶資金", 100000, 100000000, 10000000, step=100000)
+    with st.expander("AI 權重設定", expanded=False):
+        ai_w_tech = st.slider("技術／趨勢", 0, 50, 30, step=1)
+        ai_w_event = st.slider("事件", 0, 40, 20, step=1)
+        ai_w_chip = st.slider("籌碼事件／大戶代理", 0, 40, 15, step=1)
+        ai_w_momentum = st.slider("動能／突破", 0, 30, 15, step=1)
+        ai_w_risk = st.slider("風險／過熱控制", 0, 30, 20, step=1)
+    st.caption("法人真實買賣超若尚未串接，不會用假資料補分；AI 會以現有真實量價／事件／籌碼代理重新正規化權重。")
+
+    st.divider()
     uploaded=st.file_uploader("補充券商權證 CSV（可選）",type=["csv"])
     st.caption("官方資料可做每日掃描；若要 Delta、IV、即時買賣價差，仍建議補充券商資料或未來串接即時行情。")
 
@@ -1600,7 +1443,7 @@ if scan_mode:
 
     if show_funnel:
         with st.expander("🔍 為什麼正式預篩會是 0？｜篩選漏斗", expanded=fallback_used):
-            st.dataframe(funnel_df, width="stretch", hide_index=True)
+            show_df(funnel_df, width="stretch", hide_index=True)
             if not funnel_df.empty:
                 st.caption("最後一關若突然歸零，通常代表權證標的代號/成交量資料關聯或門檻造成，而不是全市場真的沒有股票。")
 else:
@@ -1618,7 +1461,7 @@ if scan_mode:
 
 save_last_ranking(ranking)
 
-# V6.18.2：獨立事件掃描，不經過權證活躍度預篩
+# V6.17：獨立事件掃描，不經過權證活躍度預篩
 event_pool = build_event_pool(
     all_stocks,
     min_stock_volume=min_stock_volume,
@@ -1631,7 +1474,9 @@ with st.spinner("掃描全市場事件型機會…"):
 with st.spinner("掃描市場過熱股票…"):
     overheat_ranking = build_overheat_ranking(event_pool, max_scan=120)
 
-# V6.18.2：KD 改為手動觸發。
+with st.spinner("掃描全市場連跌＋3K-2D負值股票…"):
+    _kd_records = all_stocks[["code","name"]].to_dict("records") if all_stocks is not None and not all_stocks.empty else []
+    kd_decline_ranking = build_kd_decline_ranking(_kd_records, EXPECTED_TRADE_DATE)
 
 # 固定關注股另外計算，不受每日 TOP 排名限制
 with st.spinner("更新我的關注股…"):
@@ -1750,7 +1595,7 @@ if intraday_mode and not ranking.empty:
     # 固定關注股
     _codes += [str(c) for c in watchlist]
 
-    # V6.18.2 事件雷達前10名
+    # V6.17 事件雷達前10名
     if "event_ranking" in globals() and event_ranking is not None and not event_ranking.empty:
         _codes += event_ranking.head(10)["code"].astype(str).tolist()
 
@@ -1784,61 +1629,109 @@ ranking["盤中判斷"] = ranking.apply(
 
 # Header metrics
 c1,c2,c3,c4 = st.columns(4)
-def current_recommended(df):
-    if df is None or df.empty:
-        return pd.DataFrame()
-    x=df.copy()
-    score=pd.to_numeric(x.get("score"),errors="coerce").fillna(0)
-    setup=x.get("setup",pd.Series("",index=x.index)).astype(str)
-    status=x.get("candidate_status",pd.Series("本次正常",index=x.index)).astype(str)
-    return x[(score>=70) &
-             (~setup.isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"])) &
-             (~status.isin(["前次高分保留","事件追蹤保留"]))].copy()
-
-recommended_now = current_recommended(ranking)
-
 valid = ranking[pd.to_numeric(ranking["score"], errors="coerce").fillna(0) > 0].copy()
-c1.metric("今日推薦", len(recommended_now))
+c1.metric("今日候選", len(ranking))
 c2.metric("80分以上強力候選", int((pd.to_numeric(valid["score"], errors="coerce").fillna(0) >= 80).sum()))
 _event80 = int((pd.to_numeric(event_ranking["event_score"], errors="coerce").fillna(0) >= 80).sum()) if event_ranking is not None and not event_ranking.empty else 0
 c3.metric("80分以上事件機會", _event80)
 c4.metric("趨勢回檔/突破", int(valid["setup"].isin(["趨勢回檔","突破型"]).sum()))
 
 st.markdown("### 🧭 今日市場分析")
-_current_rank = ranking.copy()
-if not _current_rank.empty and "candidate_status" in _current_rank.columns:
-    _current_rank = _current_rank[~_current_rank["candidate_status"].isin(["前次高分保留","事件追蹤保留"])].copy()
-_score70 = int((pd.to_numeric(_current_rank.get("score"), errors="coerce").fillna(0) >= 70).sum()) if not _current_rank.empty else 0
-st.caption(f"本次70分以上候選 {_score70} 檔；其中符合『今日推薦』完整條件 {len(recommended_now)} 檔。兩者不再混用。")
-_valid_scored = int((pd.to_numeric(_current_rank.get("score"),errors="coerce").fillna(0) > 0).sum()) if not _current_rank.empty else 0
-_failed_scored = max(0, len(_current_rank)-_valid_scored) if not _current_rank.empty else 0
-st.caption(f"評分資料健康：有效評分 {_valid_scored}/{len(_current_rank)} 檔｜資料不足/失敗 {_failed_scored} 檔。V6.18.6 會自動用批次日K補算失敗標的。")
 st.info(market_summary_text(ranking, event_ranking))
 
-# V6.18.2 每日推薦驗證快照
+# V6.17 每日推薦驗證快照
 _previous_recs, _previous_rec_date = load_previous_recommendation_snapshot()
 save_recommendation_snapshot(ranking)
 
-TAB_TODAY, TAB_EVENT, TAB_OVERHEAT, TAB_KD, TAB_VALIDATE, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
-    ["🔥 今日推薦","⚡ 事件型機會","🌡️ 過熱雷達","📉 連跌＋3K-2D","📊 昨日推薦驗證","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
+# V7: AI and warrant radar share the exact same ranking/live/history core.
+ai_weights = {"tech":ai_w_tech,"event":ai_w_event,"chip":ai_w_chip,"momentum":ai_w_momentum,"risk":ai_w_risk}
+ai_ranking = build_unified_ai_ranking(ranking, ai_weights)
+
+TAB_AI, TAB_AI_ACCOUNT, TAB_AI_ERROR, TAB_TODAY, TAB_EVENT, TAB_OVERHEAT, TAB_KD, TAB_VALIDATE, TAB_NEXT, TAB_WATCH, TAB_YDAY, TAB_WARRANT, TAB_SETTINGS = st.tabs(
+    ["🤖 AI統一排行","💰 AI模擬帳戶","🧠 AI錯誤分析","🔥 今日推薦","⚡ 事件型機會","🌡️ 過熱雷達","📉 連跌＋3K-2D","📊 昨日推薦驗證","🔭 NEXT 潛在標的","⭐ 我的關注股","⏪ 昨日追蹤","🎯 權證排行","⚙️ 模型說明"])
+
+
+with TAB_AI:
+    st.subheader("🤖 AI 統一機會排行｜與權證雷達同一資料核心")
+    st.caption("此頁不再使用示範資料。技術、事件、過熱、3K-2D、盤中行情全部直接沿用本 App 同一次市場掃描。法人資料未串接時會明確標示『待法人資料源』，不會隨機造數。")
+    if ai_ranking.empty:
+        st.warning("目前沒有可供 AI 統一評分的市場資料。")
+    else:
+        af=ai_ranking[(ai_ranking["AI總分"]>=ai_min_score) & (ai_ranking["過熱度"]<=ai_max_heat)].copy()
+        a1,a2,a3,a4,a5=st.columns(5)
+        a1.metric("AI掃描",f"{len(ai_ranking)} 檔")
+        a2.metric("AI 80+",f"{int((ai_ranking['AI總分']>=80).sum())} 檔")
+        a3.metric("事件 80+",f"{int((ai_ranking['事件']>=80).sum())} 檔")
+        a4.metric("過熱警示",f"{int((ai_ranking['過熱度']>=85).sum())} 檔")
+        a5.metric("模擬買進",f"{int((ai_ranking['AI動作']=='🟢 模擬買進').sum())} 檔")
+        cols=["代號","股票","AI總分","原雷達分數","估計勝率%","報酬風險比","技術面","事件","籌碼／大戶代理","法人","大戶","過熱度","資料信心%","盤中漲跌幅%","AI動作"]
+        show_df(af[[c for c in cols if c in af.columns]],width="stretch",hide_index=True)
+        with st.expander("AI 統一評分邏輯", expanded=False):
+            st.markdown(f"""
+- 技術／趨勢：**{ai_w_tech}**
+- 事件：**{ai_w_event}**
+- 籌碼事件／大戶代理：**{ai_w_chip}**
+- 動能／突破：**{ai_w_momentum}**
+- 風險／過熱控制：**{ai_w_risk}**
+- 再以原權證雷達現股分數做 22% 穩定錨定，避免新 AI 權重造成兩套推薦方向完全脫鉤。
+
+**法人欄目前不製造假分數。** 等未來串接真實外資／投信／自營商資料後，才會正式納入 AI 總分。
+            """)
+
+with TAB_AI_ACCOUNT:
+    st.subheader("💰 AI 模擬帳戶｜使用真實雷達候選")
+    if ai_ranking.empty:
+        st.info("目前沒有資料。")
+    else:
+        buys=ai_ranking[ai_ranking["AI動作"]=="🟢 模擬買進"].head(5).copy()
+        if buys.empty:
+            st.warning("目前沒有符合 AI 模擬買進條件的股票；不為了湊持倉而降低標準。")
+            buys=ai_ranking.head(5).copy()
+            buys["模擬狀態"]="觀察，不建倉"
+        else:
+            buys["模擬狀態"]="模擬建倉"
+        pos=min(0.05,0.25/max(1,len(buys))) if len(buys) else 0
+        buys["建議部位%"] = round(pos*100,1)
+        buys["模擬投入金額"] = int(ai_capital*pos)
+        invested=int(buys.loc[buys["模擬狀態"]=="模擬建倉","模擬投入金額"].sum()) if "模擬狀態" in buys else 0
+        m1,m2,m3,m4=st.columns(4)
+        m1.metric("模擬資金",f"NT$ {ai_capital:,.0f}")
+        m2.metric("模擬投入",f"NT$ {invested:,.0f}")
+        m3.metric("現金部位",f"NT$ {ai_capital-invested:,.0f}")
+        m4.metric("模擬持倉",int((buys["模擬狀態"]=="模擬建倉").sum()))
+        show=["代號","股票","AI總分","估計勝率%","報酬風險比","過熱度","建議部位%","模擬投入金額","模擬狀態"]
+        show_df(buys[[c for c in show if c in buys.columns]],width="stretch",hide_index=True)
+        st.caption("此為模型驗證用模擬帳戶，不會自動下單。")
+
+with TAB_AI_ERROR:
+    st.subheader("🧠 AI 錯誤／矛盾訊號分析")
+    st.caption("直接檢查同一批真實市場資料中的模型矛盾，而不是用另一組示範股票。")
+    issues=[]
+    if not ai_ranking.empty:
+        for _,r in ai_ranking.iterrows():
+            if _ai_safe(r.get("AI總分"),0)>=75 and _ai_safe(r.get("過熱度"),0)>=80:
+                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"AI高分但已偏過熱","修正建議":"降低追價；等待量縮／回測／盤中止穩"})
+            if _ai_safe(r.get("事件"),0)>=80 and _ai_safe(r.get("籌碼／大戶代理"),50)<45:
+                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"事件強但籌碼代理偏弱","修正建議":"事件訊號需籌碼或法人後續確認"})
+            if _ai_safe(r.get("資料信心%"),100)<60:
+                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"資料信心偏低","修正建議":"暫不提高部位，先檢查資料異常診斷"})
+            live=pd.to_numeric(r.get("盤中漲跌幅%"),errors="coerce")
+            if _ai_safe(r.get("AI總分"),0)>=75 and pd.notna(live) and live<=-4:
+                issues.append({"代號":r["代號"],"股票":r["股票"],"可能問題":"高分但盤中明顯轉弱","修正建議":"等待止穩，不使用日線高分硬接跌勢"})
+    if issues:
+        show_df(pd.DataFrame(issues).drop_duplicates(),width="stretch",hide_index=True)
+    else:
+        st.success("目前沒有明顯的模型矛盾訊號。")
+
 
 with TAB_TODAY:
     st.subheader("今日推薦")
-    recommended = recommended_now.copy()
+    recommended = ranking[
+        (pd.to_numeric(ranking["score"], errors="coerce").fillna(0) >= 70) &
+        (~ranking["setup"].isin(["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"])) &
+        (~ranking["candidate_status"].isin(["前次高分保留","事件追蹤保留"]))
+    ].copy()
 
-    with st.expander("🔎 推薦檔數診斷", expanded=False):
-        _tmp=ranking.copy()
-        if not _tmp.empty:
-            _tmp["score_num"]=pd.to_numeric(_tmp["score"],errors="coerce").fillna(0)
-            _tmp70=_tmp[_tmp["score_num"]>=70].copy()
-            st.write(f"70分以上共 {len(_tmp70)} 檔；正式今日推薦 {len(recommended)} 檔。")
-            if not _tmp70.empty:
-                _tmp70["排除原因"]=_tmp70.apply(lambda r: (
-                    "前次/事件追蹤保留" if str(r.get("candidate_status","")) in ["前次高分保留","事件追蹤保留"] else
-                    "訊號不適合追價" if str(r.get("setup","")) in ["過熱・不追","弱勢觀察","資料錯誤","資料不足","資料待確認"] else
-                    "符合今日推薦"
-                ),axis=1)
-                st.dataframe(_tmp70[[c for c in ["code","name","score","setup","history_source","candidate_status","排除原因"] if c in _tmp70.columns]],width="stretch",hide_index=True)
     if recommended.empty:
         if ranking.empty:
             st.error("連保底候選池也無法建立。這代表股票市場日資料本身異常，不是『沒有投資標的』。")
@@ -1849,7 +1742,7 @@ with TAB_TODAY:
     else:
         recommended = recommended.head(10).copy()
     show_df = zh_stock_table(recommended)
-    st.dataframe(show_df, width="stretch", hide_index=True,
+    show_df(show_df, width="stretch", hide_index=True,
                  column_config={"機會分數":st.column_config.ProgressColumn("機會分數", min_value=0,max_value=100,format="%.1f")})
 
     top_codes = recommended[pd.to_numeric(recommended["score"], errors="coerce").fillna(0) > 0]["code"].astype(str).tolist() if ("score" in recommended.columns and "code" in recommended.columns) else []
@@ -1884,14 +1777,14 @@ with TAB_TODAY:
                 st.warning("上傳的權證資料中沒有這個標的。")
             else:
                 cols = ["warrant_code","warrant_name","issuer","price","volume","strike","expiry","days_to_expiry","otm_pct","delta","effective_leverage","spread_pct","iv","warrant_score","eligible","filter_reason"]
-                st.dataframe(zh_warrant_table(wr[[c for c in cols if c in wr.columns]].head(5)), width="stretch", hide_index=True)
+                show_df(zh_warrant_table(wr[[c for c in cols if c in wr.columns]].head(5)), width="stretch", hide_index=True)
         else:
             st.warning("目前沒有完整權證條款資料。請在左側上傳券商匯出的權證 CSV，就能直接算出『最佳券商＋最佳權證』。TWSE 每日成交量資料已可自動抓取。")
 
 with TAB_EVENT:
     st.subheader("⚡ 事件型機會")
     st.caption(
-        "V6.18.2 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
+        "V6.17 事件雷達獨立掃描全市場高流動性股票，不先經過權證活躍度門檻。"
         "事件分數 ≥60 即列入：60–69觀察、70–79推薦、80+強力事件機會。"
     )
 
@@ -1928,7 +1821,7 @@ with TAB_EVENT:
             axis=1
         )
 
-        # V6.18.2 籌碼事件辨識
+        # V6.17 籌碼事件辨識
         _chip_events = _evt["code"].astype(str).map(chip_event_for_code)
         _evt["籌碼事件"] = _chip_events.map(lambda d: d.get("籌碼事件","⚪ 無法確認"))
         _evt["籌碼判斷信心"] = _chip_events.map(lambda d: d.get("判斷信心",0))
@@ -1962,7 +1855,7 @@ with TAB_EVENT:
             if _c != "事件分數":
                 _eshow[_c] = _eshow[_c].where(pd.notna(_eshow[_c]), "—")
 
-        st.dataframe(
+        show_df(
             _eshow,
             width="stretch",
             hide_index=True,
@@ -2015,115 +1908,130 @@ with TAB_EVENT:
         d5.metric("事件風險", f"{_num0(_er.get('event_risk')):.0f}/20")
 
 with TAB_KD:
-    st.subheader("📉 全市場 3K-2D 負值排行")
-    st.caption("V6.18.6：批次來源失敗時自動切換個股歷史備援；空資料不再被當成有效快取。")
+    st.subheader("📉 全市場連跌＋3K-2D負值雷達")
+    st.caption("條件：收盤價連跌至少3個交易日，而且 3K－2D < 0。")
+    if EXPECTED_TRADE_DATE:
+        st.caption(f"統一資料基準日：{EXPECTED_TRADE_DATE}｜舊日期備援自動排除。")
 
-    k1,k2,k3 = st.columns([2,1,1])
-    with k1:
-        kd_scan_size = st.slider(
-            "備援最多掃描檔數", 300, 900, 600, 100,
-            help="只有批次來源失敗時才使用；預設600檔兼顧涵蓋率與速度。"
-        )
-    with k2:
-        st.write(""); st.write("")
-        kd_run = st.button("🔎 高速掃描 3K-2D", use_container_width=True)
-    with k3:
-        st.write(""); st.write("")
-        kd_force = st.button("♻️ 強制重抓日K", use_container_width=True)
-
-    if kd_force:
-        kd_run = True
-
-    if kd_run:
-        with st.spinner("正在取得日K資料；若批次來源失敗會自動切換備援…"):
-            hist, diag = get_kd_history_resilient(all_stocks, force=kd_force, max_codes=kd_scan_size)
-            result = build_3k2d_from_bulk_history(hist)
-            st.session_state["kd6186_result"] = result
-            st.session_state["kd6186_diag"] = diag
-            st.session_state["kd6186_at"] = pd.Timestamp.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    result = st.session_state.get("kd6186_result", pd.DataFrame())
-    diag = st.session_state.get("kd6186_diag", {})
-    updated = st.session_state.get("kd6186_at", "尚未掃描")
-
-    st.caption(f"最後掃描：{updated}")
-
-    d1,d2,d3,d4,d5 = st.columns(5)
-    d1.metric("資料來源", str(diag.get("source","—")))
-    d2.metric("抓到交易日", int(diag.get("trade_days",0) or 0))
-    d3.metric("歷史股票數", int(diag.get("stocks",0) or 0))
-    d4.metric("歷史資料筆數", int(diag.get("rows",0) or 0))
-    d5.metric("3K-2D負值", 0 if result is None else len(result))
-
-    if diag.get("source") == "個股歷史備援":
-        st.info(
-            f"批次來源未取得資料，已自動改用個股歷史備援："
-            f"嘗試 {int(diag.get('fallback_attempted',0))} 檔，成功 {int(diag.get('fallback_success',0))} 檔。"
-        )
-
-    if result is None or result.empty:
-        if diag and int(diag.get("stocks",0) or 0) == 0:
-            st.error("目前所有日K來源都沒有取得有效資料。請按「♻️ 強制重抓日K」；若仍為0，代表資料源被限制，而不是3K-2D公式沒有股票。")
-        else:
-            st.info("已取得日K，但目前掃描範圍內沒有 3K-2D < 0 的股票。")
+    if kd_decline_ranking is None or kd_decline_ranking.empty:
+        st.success("目前全市場沒有同時符合「連跌≥3日＋3K－2D<0」的股票。")
     else:
-        kd = result.copy()
-        show = pd.DataFrame({
-            "股票": kd["code"].astype(str).map(stock_label),
-            "3K-2D": pd.to_numeric(kd["3K-2D"], errors="coerce"),
-            "K值": pd.to_numeric(kd["K值"], errors="coerce"),
-            "D值": pd.to_numeric(kd["D值"], errors="coerce"),
-            "連跌日數": pd.to_numeric(kd["連跌日數"], errors="coerce"),
-            "連跌≥3日": pd.to_numeric(kd["連跌日數"], errors="coerce").map(
-                lambda x: "⭐ 是" if pd.notna(x) and x >= 3 else "—"
-            ),
-            "KD狀態": kd.get("KD狀態","—"),
-            "日K收盤": pd.to_numeric(kd.get("最新收盤"), errors="coerce"),
+        _kd = kd_decline_ranking.copy()
+        _kd["超賣狀態"] = _kd["KD超賣"].map({True:"🔥 K、D皆≤20", False:"—"})
+
+        _kdshow = pd.DataFrame({
+            "股票": _kd["code"].astype(str).map(stock_label),
+            "連跌日數": _kd["連跌日數"],
+            "K值": _kd["K值"],
+            "D值": _kd["D值"],
+            "3K-2D": _kd["3K-2D"],
+            "KD狀態": _kd["KD狀態"],
+            "超賣狀態": _kd["超賣狀態"],
+            "資料日期": _kd["資料日期"] if "資料日期" in _kd.columns else "—",
+            "最新收盤": _kd["最新收盤"],
         })
-        st.dataframe(show, width="stretch", hide_index=True)
+        show_df(_kdshow, width="stretch", hide_index=True)
+
+        total = len(_kd)
+        negative10 = int((_kd["3K-2D"] <= -10).sum())
+        oversold = int(_kd["KD超賣"].fillna(False).sum())
+        d5 = int((_kd["連跌日數"] >= 5).sum())
+
+        c1,c2,c3,c4 = st.columns(4)
+        c1.metric("符合股票數", total)
+        c2.metric("3K-2D≤-10", negative10)
+        c3.metric("KD超賣", oversold)
+        c4.metric("連跌≥5日", d5)
+
+        _codes = _kd["code"].astype(str).tolist()
+        _chosen = st.selectbox(
+            "查看個股",
+            _codes,
+            format_func=stock_label,
+            key="kd_3k2d_stock"
+        )
+        _r = _kd[_kd["code"].astype(str) == str(_chosen)].iloc[0]
+
+        a,b,c,d = st.columns(4)
+        a.metric("連跌日數", f"{int(_r['連跌日數'])} 日")
+        b.metric("K值", f"{float(_r['K值']):.2f}")
+        c.metric("D值", f"{float(_r['D值']):.2f}")
+        d.metric("3K-2D", f"{float(_r['3K-2D']):+.2f}")
+
+        if bool(_r.get("KD超賣", False)):
+            st.warning("此股已連跌≥3日、3K－2D為負值，而且K、D同時低於20，屬於較深的短線弱勢/超賣區。")
+        else:
+            st.caption("此股符合連跌與3K－2D負值條件，但K、D尚未同時進入20以下。")
 
 with TAB_VALIDATE:
     st.subheader("📊 推薦績效驗證｜1日・3日・5日")
-    st.caption("效能模式：只有按『更新績效驗證』才重新計算歷史資料。")
+    st.caption("從 V6.15 起保存每日推薦快照；V6.17 會用後續交易日實際價格驗證 1/3/5 日表現。")
 
-    if st.button("🔄 更新績效驗證",use_container_width=True):
-        with st.spinner("正在更新推薦績效…"):
-            _vhist=load_validation_history_all()
-            _new=build_multiday_validation(_vhist) if not _vhist.empty else pd.DataFrame()
-            save_validation_cached_result(_new)
+    try:
+        _vhist = pd.read_csv(VALIDATION_HISTORY_PATH, dtype={"code":str}) if VALIDATION_HISTORY_PATH.exists() else pd.DataFrame()
+    except Exception:
+        _vhist = pd.DataFrame()
 
-    _mv=load_validation_cached_result()
-    if _mv is None or _mv.empty:
-        st.info("尚未有績效快取，請按『🔄 更新績效驗證』。")
+    if _vhist.empty:
+        st.info("目前還沒有足夠的推薦歷史。系統會持續累積，之後自動形成1日、3日、5日驗證。")
     else:
-        _mv["snapshot_date"]=_mv["snapshot_date"].astype(str)
-        _dates=sorted(_mv["snapshot_date"].dropna().unique(),reverse=True)
-        _latest_date=_dates[0] if _dates else ""
-        _latest=_mv[_mv["snapshot_date"]==_latest_date].copy()
-        st.markdown(f"### 最近一批推薦：{_latest_date}")
+        _mv = build_multiday_validation(_vhist)
 
-        def _col(df,name):
-            return df[name] if name in df.columns else pd.Series(pd.NA,index=df.index)
+        if _mv.empty:
+            st.info("推薦歷史目前尚無法完成多日驗證；系統會隨交易日累積自動補齊1日、3日、5日結果。")
+        else:
+            # 最新推薦批次優先顯示
+            _mv["snapshot_date"] = _mv["snapshot_date"].astype(str)
+            _latest_dates = sorted(_mv["snapshot_date"].dropna().unique(), reverse=True)
+            _latest_date = _latest_dates[0] if _latest_dates else ""
+            _latest = _mv[_mv["snapshot_date"] == _latest_date].copy()
 
-        _show=pd.DataFrame({
-            "股票":_latest["code"].astype(str).map(stock_label),
-            "推薦分數":pd.to_numeric(_col(_latest,"score"),errors="coerce"),
-            "基準價":pd.to_numeric(_col(_latest,"close"),errors="coerce"),
-            "1日報酬(%)":pd.to_numeric(_col(_latest,"1日報酬(%)"),errors="coerce"),
-            "3日報酬(%)":pd.to_numeric(_col(_latest,"3日報酬(%)"),errors="coerce"),
-            "5日報酬(%)":pd.to_numeric(_col(_latest,"5日報酬(%)"),errors="coerce"),
-            "5日內最高漲幅(%)":pd.to_numeric(_col(_latest,"5日內最高漲幅(%)"),errors="coerce"),
-            "5日內最大回撤(%)":pd.to_numeric(_col(_latest,"5日內最大回撤(%)"),errors="coerce"),
-            "驗證結果":_col(_latest,"驗證結果")
-        })
-        st.dataframe(_show,width="stretch",hide_index=True)
-        _s1=validation_summary(_mv,"1日報酬(%)")
-        _s3=validation_summary(_mv,"3日報酬(%)")
-        _s5=validation_summary(_mv,"5日報酬(%)")
-        a,b,c=st.columns(3)
-        a.metric("1日命中率",f"{_s1['命中率']:.1f}%")
-        b.metric("3日命中率",f"{_s3['命中率']:.1f}%")
-        c.metric("5日命中率",f"{_s5['命中率']:.1f}%")
+            st.markdown(f"### 最近一批推薦：{_latest_date}")
+            _show = pd.DataFrame({
+                "股票": _latest["code"].astype(str).map(stock_label),
+                "推薦分數": pd.to_numeric(_latest.get("score"), errors="coerce"),
+                "推薦訊號": _latest.get("setup","—"),
+                "基準價": pd.to_numeric(_latest.get("close"), errors="coerce"),
+                "1日報酬(%)": pd.to_numeric(_latest["1日報酬(%)"] if "1日報酬(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "3日報酬(%)": pd.to_numeric(_latest["3日報酬(%)"] if "3日報酬(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "5日報酬(%)": pd.to_numeric(_latest["5日報酬(%)"] if "5日報酬(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "5日內最高漲幅(%)": pd.to_numeric(_latest["5日內最高漲幅(%)"] if "5日內最高漲幅(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "5日內最大回撤(%)": pd.to_numeric(_latest["5日內最大回撤(%)"] if "5日內最大回撤(%)" in _latest.columns else pd.Series(pd.NA, index=_latest.index), errors="coerce"),
+                "驗證結果": _latest.get("驗證結果","—")
+            })
+            show_df(_show, width="stretch", hide_index=True)
+
+            st.markdown("### 📈 模型歷史驗證")
+            _s1 = validation_summary(_mv, "1日報酬(%)")
+            _s3 = validation_summary(_mv, "3日報酬(%)")
+            _s5 = validation_summary(_mv, "5日報酬(%)")
+
+            c1,c2,c3 = st.columns(3)
+            with c1:
+                st.metric("1日命中率", f"{_s1['命中率']:.1f}%", f"樣本 {_s1['樣本數']}")
+                st.caption(f"平均報酬 {_s1['平均報酬']:+.2f}%｜中位數 {_s1['中位數報酬']:+.2f}%")
+            with c2:
+                st.metric("3日命中率", f"{_s3['命中率']:.1f}%", f"樣本 {_s3['樣本數']}")
+                st.caption(f"平均報酬 {_s3['平均報酬']:+.2f}%｜中位數 {_s3['中位數報酬']:+.2f}%")
+            with c3:
+                st.metric("5日命中率", f"{_s5['命中率']:.1f}%", f"樣本 {_s5['樣本數']}")
+                st.caption(f"平均報酬 {_s5['平均報酬']:+.2f}%｜中位數 {_s5['中位數報酬']:+.2f}%")
+
+            # 整體最大有利/不利變動
+            _best_src = _mv["5日內最高漲幅(%)"] if "5日內最高漲幅(%)" in _mv.columns else pd.Series(dtype=float)
+            _draw_src = _mv["5日內最大回撤(%)"] if "5日內最大回撤(%)" in _mv.columns else pd.Series(dtype=float)
+            best = pd.to_numeric(_best_src, errors="coerce").dropna()
+            draw = pd.to_numeric(_draw_src, errors="coerce").dropna()
+            d1,d2,d3 = st.columns(3)
+            d1.metric("平均5日內最高漲幅", f"{best.mean():+.2f}%" if len(best) else "—")
+            d2.metric("平均5日內最大回撤", f"{draw.mean():+.2f}%" if len(draw) else "—")
+            d3.metric("總驗證樣本", len(_mv))
+
+            st.info(
+                "命中率目前定義為該觀察期報酬 ≥ +2%。"
+                "除了命中率，也同時看平均報酬、中位數、最高漲幅與最大回撤，"
+                "避免只看『有沒有上漲』而忽略風險與報酬品質。"
+            )
 
 with TAB_OVERHEAT:
     st.subheader("🌡️ 過熱股票雷達")
@@ -2138,7 +2046,7 @@ with TAB_OVERHEAT:
             "RSI":_oh.get("RSI",pd.NA),"MA20乖離(%)":_oh.get("MA20乖離(%)",pd.NA),
             "量比":_oh.get("量比",pd.NA),"近5日漲幅(%)":_oh.get("近5日漲幅(%)",pd.NA),
             "近10日漲幅(%)":_oh.get("近10日漲幅(%)",pd.NA),"為什麼過熱":_oh["過熱原因"]})
-        st.dataframe(_ohshow,width="stretch",hide_index=True)
+        show_df(_ohshow,width="stretch",hide_index=True)
         _ohcodes=_oh["code"].astype(str).tolist()
         _ohc=st.selectbox("查看過熱股票",_ohcodes,format_func=stock_label,key="overheat_stock")
         _ohr=_oh[_oh["code"].astype(str)==str(_ohc)].iloc[0]
@@ -2168,7 +2076,7 @@ with TAB_YDAY:
             yd_show = yd_show.rename(columns={"score":"昨日機會分數","setup":"昨日訊號類型","close":"昨日收盤價"})
             yd_show = yd_show[[c for c in ["股票","昨日機會分數","昨日訊號類型","昨日收盤價","至今變化(%)"] if c in yd_show.columns]]
             st.caption(f"訊號日期：{dates[1]}")
-            st.dataframe(yd_show, width="stretch", hide_index=True)
+            show_df(yd_show, width="stretch", hide_index=True)
         else:
             st.info("目前只有今天的快照；明天再打開就會開始形成昨日績效。")
     else:
@@ -2190,13 +2098,13 @@ with TAB_NEXT:
             for _c in ["盤中成交價","盤中漲跌幅(%)","盤中委買","盤中委賣","行情時間"]:
                 if _c in _nshow.columns:
                     _nshow[_c] = _nshow[_c].where(pd.notna(_nshow[_c]), "等待盤中報價")
-            st.dataframe(_nshow, width="stretch", hide_index=True)
+            show_df(_nshow, width="stretch", hide_index=True)
             st.caption("NEXT 不是立即買進訊號；代表條件正在接近，後續若量價/突破條件改善，可能進入今日推薦。")
 
 with TAB_WATCH:
     st.subheader("我的固定關注股")
     st.caption("這份清單不會因每日全市場排名而消失，可在左側自行修改。")
-    st.dataframe(zh_stock_table(watch_ranking), width="stretch", hide_index=True)
+    show_df(zh_stock_table(watch_ranking), width="stretch", hide_index=True)
 
 with TAB_WARRANT:
     st.subheader("🎯 個股推薦前三名＋各自權證前五名")
@@ -2235,7 +2143,7 @@ with TAB_WARRANT:
         _top3 = _base_stock[_base_stock["code"].astype(str).isin(_selected_codes)].copy()
         _top3["_順序"] = _top3["code"].astype(str).map({c:i for i,c in enumerate(_selected_codes)})
         _top3 = _top3.sort_values("_順序").drop(columns=["_順序"], errors="ignore")
-        st.dataframe(
+        show_df(
             zh_stock_table(_top3),
             width="stretch",
             hide_index=True,
@@ -2310,7 +2218,7 @@ with TAB_WARRANT:
                 ]
                 _show = _top5[[c for c in _cols if c in _top5.columns]]
 
-                st.dataframe(
+                show_df(
                     zh_warrant_table(_show),
                     width="stretch",
                     hide_index=True
@@ -2331,7 +2239,7 @@ with TAB_WARRANT:
 
 with TAB_SETTINGS:
     st.markdown("""
-### V6.18.2 雙軌＋獨立事件雷達
+### V6.17 雙軌＋獨立事件雷達
 每檔股票同時計算 **趨勢分數** 與 **事件分數**。一般突破／回檔使用趨勢模型；
 爆量急跌、恐慌洗盤、重大事件後止穩反彈，則由事件模型接手。
 
@@ -2371,11 +2279,13 @@ with TAB_SETTINGS:
 若你有券商 API，可把即時現股/權證 bid-ask、Delta、IV、有效槓桿直接餵給本 App；評分引擎不用重寫，只替換資料來源即可。
 """)
 
+st.markdown("### 🤖 V7 統一資料核心")
+st.info("AI 操盤、今日推薦、事件雷達、過熱雷達、3K-2D、固定關注與權證排行現在共用同一批市場掃描結果。AI 不再使用 V1 的隨機示範資料。")
 st.caption("資料來源以 TWSE 公開資料為主；免費公開資料可能為盤後/延遲。投資前仍需以券商即時報價確認。")
 
 
-# ===== V6.18.2 籌碼評分說明 =====
-with st.expander("🏦 V6.18.6 法人／大戶籌碼評分", expanded=False):
+# ===== V6.17 籌碼評分說明 =====
+with st.expander("🏦 V6.17 法人／大戶籌碼評分", expanded=False):
     st.markdown("""
 **新增籌碼觀測（最高 20 分）**
 
@@ -2390,7 +2300,7 @@ with st.expander("🏦 V6.18.6 法人／大戶籌碼評分", expanded=False):
 """)
 
 
-with st.expander("🧠 V6.18.6 籌碼事件辨識說明", expanded=False):
+with st.expander("🧠 V6.17 籌碼事件辨識說明", expanded=False):
     st.markdown("""
 系統會把爆量事件分成 **疑似大戶倒貨、籌碼換手、疑似大戶吸籌、洗盤後承接、無法確認**。
 判斷依據包含爆量程度、K棒收盤位置、上下影線、OBV、MA20、大量區是否守住，以及可取得時的法人方向。
@@ -2399,17 +2309,17 @@ with st.expander("🧠 V6.18.6 籌碼事件辨識說明", expanded=False):
 T日屬初判，後續 T+1～T+3 若大量區守住、量能收斂或法人方向確認，可信度才會提高。
 """)
 
-with st.expander("🌡️ V6.18.6 過熱判斷說明", expanded=False):
+with st.expander("🌡️ V6.17 過熱判斷說明", expanded=False):
     st.markdown("""
-V6.18.2 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
+V6.17 使用 **RSI、MA20乖離、布林帶位置、3/5/10日漲速、成交量異常、K棒長上影、ATR波動擴張、OBV量價背離** 交叉判斷。
 分級：🔴80+極度過熱、🟠65–79明顯過熱、🟡50–64偏熱觀察、🟢0–49尚未過熱。
 
 另外獨立計算「反轉風險」，因為過熱不等於立即反轉；真正需要提高警戒的是過熱同時出現爆量滯漲、長上影、OBV背離或急漲後轉弱。
 """)
 
-with st.expander("📊 V6.18.6 昨日推薦驗證說明", expanded=False):
+with st.expander("📊 V6.17 昨日推薦驗證說明", expanded=False):
     st.markdown("""
-系統從 V6.18.2 起每天保存推薦快照，下一個有資料的交易日自動比對：
+系統從 V6.17 起每天保存推薦快照，下一個有資料的交易日自動比對：
 **昨日推薦分數、今日模型分數、分數變化、昨日基準價、今日價格、今日漲跌幅與符合結果。**
 
 目前「今日符合值」定義為：**昨日推薦股中，今日相對昨日基準價上漲至少 2% 的比例**。
@@ -2417,12 +2327,12 @@ with st.expander("📊 V6.18.6 昨日推薦驗證說明", expanded=False):
 """)
 
 
-with st.expander("📊 V6.18.2 多日績效驗證說明", expanded=False):
+with st.expander("📊 V6.17 多日績效驗證說明", expanded=False):
     st.markdown("""
 ### 為什麼要看 1 / 3 / 5 日？
 單看隔日漲跌很容易錯判模型。例如事件股可能隔日整理，但第3～5日才真正反彈。
 
-因此 V6.18.2 同時追蹤：
+因此 V6.17 同時追蹤：
 - **1日報酬**
 - **3日報酬**
 - **5日報酬**
@@ -2435,7 +2345,7 @@ with st.expander("📊 V6.18.2 多日績效驗證說明", expanded=False):
 """)
 
 
-with st.expander("📉 V6.18.6 3K-2D弱勢雷達說明", expanded=False):
+with st.expander("📉 V6.17 3K-2D弱勢雷達說明", expanded=False):
     st.markdown("""
 ### 正式條件
 - **連續收盤下跌 ≥ 3 個交易日**
@@ -2451,12 +2361,4 @@ with st.expander("📉 V6.18.6 3K-2D弱勢雷達說明", expanded=False):
 
 這個雷達是用來找「已經連跌且短線動能非常弱」的股票，並不是直接買進訊號。
 若後續再搭配 **止跌、量縮、長下影、KD翻揚、法人回補或事件型承接**，才更適合觀察反彈機會。
-""")
-
-with st.expander("💾 V6.18.2 推薦歷史保存說明", expanded=False):
-    st.markdown("""
-V6.18.2 改為每天每檔保留**第一次正式推薦**，盤中刷新不覆寫原始分數與基準價，並同步寫入主檔與備援檔。
-
-注意：Streamlit Cloud 的執行磁碟不是永久資料庫。若重新部署，要真正延續舊歷史，需把既有的
-`recommendation_validation_history.csv` 一併保留在專案中；本版會自動合併主檔與備援檔並去重。
 """)

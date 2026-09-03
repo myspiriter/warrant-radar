@@ -3,17 +3,36 @@ from datetime import date
 from typing import Optional
 from pathlib import Path
 import time
+import random
 import re
 import pandas as pd
 import requests
 from io import StringIO
 
-HEADERS = {"User-Agent": "Mozilla/5.0 WarrantRadar/2.0"}
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 WarrantRadar/6.18",
+    "Accept": "application/json,text/plain,*/*",
+    "Referer": "https://www.twse.com.tw/",
+}
+SESSION = requests.Session()
+SESSION.headers.update(HEADERS)
 
-def _get_json(url, params=None, timeout=20):
-    r = requests.get(url, params=params, timeout=timeout, headers=HEADERS)
-    r.raise_for_status()
-    return r.json()
+def _get_json(url, params=None, timeout=20, retries=3, backoff=0.7):
+    """HTTP JSON with retry/backoff for TWSE transient 429/5xx failures."""
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            r = SESSION.get(url, params=params, timeout=timeout)
+            if r.status_code == 429 or 500 <= r.status_code < 600:
+                raise requests.HTTPError(f"HTTP {r.status_code}", response=r)
+            r.raise_for_status()
+            return r.json()
+        except (requests.RequestException, ValueError) as e:
+            last_err = e
+            if attempt >= retries:
+                raise
+            time.sleep(backoff * (2 ** attempt) + random.uniform(0.05, 0.25))
+    raise last_err
 
 def _num(s):
     return pd.to_numeric(
@@ -44,19 +63,130 @@ def twse_stock_month(stock_no: str, month: Optional[str] = None) -> pd.DataFrame
     df["volume"] = df["volume"] / 1000.0
     return df[["date","open","high","low","close","volume"]].dropna(subset=["close"])
 
-def twse_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
-    today = pd.Timestamp.today().normalize()
-    frames=[]
-    for i in range(months-1,-1,-1):
-        d=today-pd.DateOffset(months=i)
+def yahoo_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
+    """Secondary OHLCV source used only when TWSE history is incomplete."""
+    stock_no = str(stock_no).strip()
+    period2 = int(time.time())
+    period1 = period2 - int(max(months, 4) * 32 * 86400)
+    symbols = [f"{stock_no}.TW", f"{stock_no}.TWO"]
+    errors=[]
+    for symbol in symbols:
         try:
-            frames.append(twse_stock_month(stock_no,d.strftime("%Y%m01")))
-            time.sleep(0.03)
-        except Exception:
-            pass
-    if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames,ignore_index=True).drop_duplicates("date").sort_values("date")
+            js = _get_json(
+                f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}",
+                {"period1":period1,"period2":period2,"interval":"1d","events":"history","includeAdjustedClose":"true"},
+                timeout=4,retries=0,backoff=0.2,
+            )
+            result=(js.get("chart",{}).get("result") or [None])[0]
+            if not result:
+                errors.append(f"{symbol}:空資料"); continue
+            ts=result.get("timestamp") or []
+            q=((result.get("indicators",{}).get("quote") or [{}])[0])
+            if not ts: continue
+            df=pd.DataFrame({
+                "date":pd.to_datetime(ts,unit="s",utc=True).tz_convert("Asia/Taipei").normalize().tz_localize(None),
+                "open":q.get("open",[]),"high":q.get("high",[]),"low":q.get("low",[]),
+                "close":q.get("close",[]),"volume":q.get("volume",[]),
+            })
+            for c in ["open","high","low","close","volume"]: df[c]=pd.to_numeric(df[c],errors="coerce")
+            df["volume"]=df["volume"]/1000.0
+            df=df.dropna(subset=["close"]).drop_duplicates("date").sort_values("date")
+            if len(df):
+                df.attrs.update({"history_source":f"Yahoo Finance {symbol}","history_rows":len(df),"months_ok":["secondary"],"history_errors":errors,"history_status":"正常" if len(df)>=60 else "部分資料"})
+                return df
+        except Exception as e:
+            errors.append(f"{symbol}:{type(e).__name__}:{str(e)[:80]}")
+    out=pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    out.attrs.update({"history_source":"Yahoo Finance fallback","history_rows":0,"months_ok":[],"history_errors":errors[-4:],"history_status":"無資料"})
+    return out
+
+def finmind_stock_history(stock_no: str, months: int = 6) -> pd.DataFrame:
+    """Independent Taiwan stock EOD fallback via FinMind TaiwanStockPrice."""
+    stock_no = str(stock_no).strip()
+    end = pd.Timestamp.today().normalize()
+    start = end - pd.DateOffset(months=max(months, 6))
+    try:
+        js = _get_json(
+            "https://api.finmindtrade.com/api/v4/data",
+            {
+                "dataset": "TaiwanStockPrice",
+                "data_id": stock_no,
+                "start_date": start.strftime("%Y-%m-%d"),
+                "end_date": end.strftime("%Y-%m-%d"),
+            },
+            timeout=4, retries=0, backoff=0.2,
+        )
+        data = js.get("data", []) if isinstance(js, dict) else []
+        if not data:
+            raise ValueError("FinMind 空資料")
+        df = pd.DataFrame(data)
+        aliases = {
+            "date":"date", "open":"open", "max":"high", "min":"low", "close":"close",
+            "Trading_Volume":"volume"
+        }
+        out = pd.DataFrame()
+        for src,dst in aliases.items():
+            out[dst] = df[src] if src in df.columns else pd.NA
+        out["date"] = pd.to_datetime(out["date"], errors="coerce")
+        for c in ["open","high","low","close","volume"]:
+            out[c] = pd.to_numeric(out[c], errors="coerce")
+        out["volume"] = out["volume"] / 1000.0
+        out = out.dropna(subset=["date","close"]).drop_duplicates("date").sort_values("date")
+        out.attrs.update({
+            "history_source":"FinMind TaiwanStockPrice",
+            "history_rows":len(out),
+            "months_ok":["FinMind"],
+            "history_errors":[],
+            "history_status":"正常" if len(out)>=60 else ("部分資料" if len(out) else "無資料"),
+        })
+        return out
+    except Exception as e:
+        out = pd.DataFrame(columns=["date","open","high","low","close","volume"])
+        out.attrs.update({
+            "history_source":"FinMind fallback", "history_rows":0, "months_ok":[],
+            "history_errors":[f"FinMind:{type(e).__name__}:{str(e)[:100]}"], "history_status":"無資料"
+        })
+        return out
+
+def twse_stock_history(stock_no: str, months: int = 4) -> pd.DataFrame:
+    """V6.19 robust loader: FinMind first; TWSE monthly backup; Yahoo last resort.
+    This avoids hammering TWSE with many monthly requests during a market-wide scan.
+    """
+    stock_no=str(stock_no).strip()
+    # 1) One-request Taiwan-specific source. This is the normal path.
+    fm = finmind_stock_history(stock_no, months=max(months, 6))
+    if len(fm) >= 60:
+        return fm
+
+    # 2) TWSE official monthly endpoint as backup, with only 3 months to reduce throttling.
+    today=pd.Timestamp.today().normalize(); frames=[]; ok_months=[]; errors=list(fm.attrs.get("history_errors", []))
+    for i in range(2,-1,-1):
+        d=today-pd.DateOffset(months=i); key=d.strftime("%Y%m01")
+        try:
+            x=twse_stock_month(stock_no,key)
+            if x is not None and not x.empty:
+                frames.append(x); ok_months.append(key[:6])
+            else:
+                errors.append(f"TWSE {key[:6]}:空資料")
+        except Exception as e:
+            errors.append(f"TWSE {key[:6]}:{type(e).__name__}:{str(e)[:80]}")
+        time.sleep(0.05+random.uniform(0.01,0.03))
+    tw=pd.concat(frames,ignore_index=True).drop_duplicates("date").sort_values("date") if frames else pd.DataFrame(columns=["date","open","high","low","close","volume"])
+    if len(tw) >= 45:
+        tw.attrs.update({"history_source":"TWSE STOCK_DAY","history_rows":len(tw),"months_ok":sorted(set(ok_months)),"history_errors":errors[-6:],"history_status":"正常" if len(tw)>=60 else "部分資料"})
+        return tw
+
+    # 3) Last-resort Yahoo.
+    y=yahoo_stock_history(stock_no,months=max(months,4))
+    best=max([fm,tw,y], key=lambda x: len(x))
+    source=getattr(best,"attrs",{}).get("history_source", "fallback")
+    best.attrs.update({
+        "history_source":source, "history_rows":len(best),
+        "history_errors": (errors + list(getattr(y,"attrs",{}).get("history_errors",[])))[-8:],
+        "history_status":"正常" if len(best)>=60 else ("部分資料" if len(best) else "無資料"),
+        "fallback_reason":f"FinMind {len(fm)}筆 / TWSE {len(tw)}筆 / Yahoo {len(y)}筆",
+    })
+    return best
 
 
 def _standardize_stock_daily(df: pd.DataFrame, source_name: str, trade_date_hint: str = "") -> pd.DataFrame:
@@ -661,45 +791,3 @@ def enrich_warrant_live(base: pd.DataFrame, max_codes=80) -> pd.DataFrame:
 
     return x
 
-
-
-def twse_recent_market_history(calendar_days: int = 35) -> pd.DataFrame:
-    """V6.18.3 高速批次日K：按交易日一次抓整個 TWSE 市場，而非逐檔逐月請求。
-    35 個日曆日通常可涵蓋 20+ 個交易日，足夠 KD(9,3,3) 與連跌計算。
-    """
-    today = pd.Timestamp.today().normalize()
-    frames = []
-    seen_dates = set()
-    for i in range(max(15, int(calendar_days))):
-        d = today - pd.Timedelta(days=i)
-        # 週末直接略過，減少無效 HTTP
-        if d.weekday() >= 5:
-            continue
-        ds = d.strftime("%Y%m%d")
-        try:
-            js = _get_json(
-                "https://www.twse.com.tw/rwd/zh/afterTrading/MI_INDEX",
-                {"date": ds, "type": "ALLBUT0999", "response": "json"},
-                timeout=12,
-            )
-            out = _parse_mi_index_json(js, ds)
-            if out is None or out.empty:
-                continue
-            # 同一天只收一次；保留正式日K OHLC
-            td = str(out.get("trade_date", pd.Series([ds])).iloc[0])
-            if td in seen_dates:
-                continue
-            seen_dates.add(td)
-            out = out[[c for c in ["code","name","trade_date","open","high","low","close","volume_lots"] if c in out.columns]].copy()
-            out["date"] = pd.to_datetime(ds, format="%Y%m%d", errors="coerce")
-            frames.append(out)
-        except Exception:
-            continue
-    if not frames:
-        return pd.DataFrame()
-    x = pd.concat(frames, ignore_index=True)
-    x["code"] = x["code"].astype(str).str.strip()
-    for c in ["open","high","low","close","volume_lots"]:
-        if c in x.columns:
-            x[c] = pd.to_numeric(x[c], errors="coerce")
-    return x.dropna(subset=["date","close"]).sort_values(["code","date"]).reset_index(drop=True)

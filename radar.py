@@ -834,7 +834,7 @@ def overheat_score_v614(hist):
 # ===== V6.17 連跌 + 3K-2D 弱勢雷達 =====
 def kd_decline_signal_v617(hist):
     """連跌日數 + 標準KD(9,3,3) + 3K-2D。
-    篩選條件：3K-2D < 0；連跌 >= 3 日作為加強訊號。
+    篩選條件：連跌 >= 3 日 且 3K-2D < 0。
     """
     if hist is None or len(hist) < 12:
         return {
@@ -905,8 +905,7 @@ def kd_decline_signal_v617(hist):
         "D值": round(float(d), 2) if pd.notna(d) else pd.NA,
         "3K-2D": round(float(value_3k2d), 2) if pd.notna(value_3k2d) else pd.NA,
         "KD狀態": status,
-        "符合條件": bool(pd.notna(value_3k2d) and value_3k2d < 0),
-        "連跌3日加強": bool(decline_days >= 3 and pd.notna(value_3k2d) and value_3k2d < 0),
+        "符合條件": bool(decline_days >= 3 and pd.notna(value_3k2d) and value_3k2d < 0),
         "KD超賣": bool(pd.notna(k) and pd.notna(d) and k <= 20 and d <= 20),
         "最新收盤": round(float(x["close"].iloc[-1]), 4) if pd.notna(x["close"].iloc[-1]) else pd.NA,
     }
