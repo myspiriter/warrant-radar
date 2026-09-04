@@ -253,7 +253,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
 
     return x
 
-st.set_page_config(page_title="個人版權證雷達 V7.2.4", page_icon="📡", layout="wide")
+st.set_page_config(page_title="個人版權證雷達 V7.2.5", page_icon="📡", layout="wide")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -497,7 +497,7 @@ def stock_ranking(watchlist):
     rows = []
     for code in watchlist:
         try:
-            h = load_hist(code)
+            h = hist_map.get(code) if isinstance(hist_map, dict) else load_hist(code)
             s = stock_score(h)
             row = {"code":str(code)}
             if isinstance(s, dict):
@@ -823,7 +823,31 @@ def build_event_pool(all_stocks: pd.DataFrame,
     )
     return s.sort_values("_流動性分", ascending=False).head(max_candidates).reset_index(drop=True)
 
-def event_dynamic_ranking(event_pool: pd.DataFrame):
+def preload_histories_parallel(stock_pool: pd.DataFrame, max_workers: int = 12):
+    """V7.2.5：事件/過熱共用同一批歷史資料；只抓一次並平行化。"""
+    if stock_pool is None or stock_pool.empty:
+        return {}
+    codes = []
+    for c in stock_pool["code"].astype(str).tolist():
+        if c and c not in codes:
+            codes.append(c)
+
+    def _one(code):
+        try:
+            return code, load_hist(code)
+        except Exception:
+            return code, pd.DataFrame()
+
+    out = {}
+    workers = min(max_workers, max(1, len(codes)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(_one, c) for c in codes]
+        for fut in as_completed(futs):
+            c, h = fut.result()
+            out[c] = h
+    return out
+
+def event_dynamic_ranking(event_pool: pd.DataFrame, hist_map=None):
     """只做事件型評分，不依賴權證門檻。"""
     base_cols = [
         "code","name","score","trend_score","event_score","score_mode","setup",
@@ -939,7 +963,7 @@ def overheat_for_code(code):
     except Exception as e:
         return {"過熱分數":0,"過熱等級":"⚪ 資料錯誤","過熱原因":str(e),"反轉風險":0}
 
-def build_overheat_ranking(stock_pool, max_scan=120):
+def build_overheat_ranking(stock_pool, max_scan=120, hist_map=None):
     if stock_pool is None or stock_pool.empty: return pd.DataFrame()
     rows=[]
     for _,rr in stock_pool.head(max_scan).iterrows():
@@ -1367,8 +1391,8 @@ def build_unified_ai_ranking(base: pd.DataFrame, weights: dict) -> pd.DataFrame:
     return out.sort_values("AI總分",ascending=False).reset_index(drop=True)
 
 
-APP_VERSION = "V7.2.4"
-APP_BUILD = "KD候選預篩・平行抓取・交易日同步・高速掃描版"
+APP_VERSION = "V7.2.5"
+APP_BUILD = "事件/過熱共用歷史快取・平行抓取・KD高速掃描版"
 
 cfg = load_cfg()
 st.title(f"📡 個人版台股權證雷達 {APP_VERSION}")
@@ -1547,11 +1571,14 @@ event_pool = build_event_pool(
     min_turnover_m=min_turnover_m,
     max_candidates=120
 )
-with st.spinner("掃描全市場事件型機會…"):
-    event_ranking = event_dynamic_ranking(event_pool)
+with st.spinner("高速載入事件/過熱共用歷史資料…"):
+    _event_hist_map = preload_histories_parallel(event_pool, max_workers=12)
 
-with st.spinner("掃描市場過熱股票…"):
-    overheat_ranking = build_overheat_ranking(event_pool, max_scan=120)
+with st.spinner("計算全市場事件型機會…"):
+    event_ranking = event_dynamic_ranking(event_pool, hist_map=_event_hist_map)
+
+with st.spinner("計算市場過熱股票…"):
+    overheat_ranking = build_overheat_ranking(event_pool, max_scan=120, hist_map=_event_hist_map)
 
 with st.spinner("高速掃描連跌＋3K-2D：先篩今日下跌股，再平行計算歷史KD…"):
     _kd_cols = [c for c in ["code","name","trade_date","open","high","low","close","change","volume_lots","volume"] if c in all_stocks.columns]
