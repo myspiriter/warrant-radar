@@ -846,6 +846,7 @@ def kd_decline_signal_v617(hist):
             "符合條件": False,
             "KD超賣": False,
             "最新收盤": pd.NA,
+            "資料日期": pd.NA,
         }
 
     x = hist.copy().sort_values("date").reset_index(drop=True)
@@ -908,5 +909,6 @@ def kd_decline_signal_v617(hist):
         "符合條件": bool(decline_days >= 3 and pd.notna(value_3k2d) and value_3k2d < 0),
         "KD超賣": bool(pd.notna(k) and pd.notna(d) and k <= 20 and d <= 20),
         "最新收盤": round(float(x["close"].iloc[-1]), 4) if pd.notna(x["close"].iloc[-1]) else pd.NA,
+        "資料日期": pd.to_datetime(x["date"].iloc[-1], errors="coerce").date().isoformat() if pd.notna(pd.to_datetime(x["date"].iloc[-1], errors="coerce")) else pd.NA,
     }
 

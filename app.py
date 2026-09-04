@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -252,7 +253,7 @@ def zh_warrant_table(df: pd.DataFrame) -> pd.DataFrame:
 
     return x
 
-st.set_page_config(page_title="個人版權證雷達 V7.2.2", page_icon="📡", layout="wide")
+st.set_page_config(page_title="個人版權證雷達 V7.2.4", page_icon="📡", layout="wide")
 
 @st.cache_data(ttl=900, show_spinner=False)
 def load_hist(code: str):
@@ -1134,48 +1135,126 @@ def validation_summary(df, horizon_col):
 
 
 
-@st.cache_data(ttl=300, show_spinner=False)
-def kd_decline_for_code(code):
+@st.cache_data(ttl=600, show_spinner=False)
+def kd_hist_base(code):
+    """只快取歷史日線；當日 OHLC 由全市場批次資料補入，不必逐檔重抓盤中行情。"""
     try:
-        return kd_decline_signal_v617(load_hist(str(code)))
+        return load_hist(str(code))
     except Exception:
-        return {
-            "連跌日數":0, "K值":pd.NA, "D值":pd.NA, "3K-2D":pd.NA,
-            "KD狀態":"⚪ 資料錯誤", "符合條件":False, "KD超賣":False,
-            "最新收盤":pd.NA
-        }
+        return pd.DataFrame()
 
-@st.cache_data(ttl=1800, show_spinner=False)
+def _upsert_today_bar(hist, rr, expected_trade_date=""):
+    """把 STOCK_DAY_ALL 的最新 OHLC 合併進個股歷史，確保 KD 與連跌以同一交易日計算。"""
+    if hist is None or hist.empty:
+        return pd.DataFrame()
+    x = hist.copy()
+    x["date"] = pd.to_datetime(x["date"], errors="coerce")
+    x = x.dropna(subset=["date"]).sort_values("date").drop_duplicates("date", keep="last")
+
+    d = pd.to_datetime(expected_trade_date or rr.get("trade_date"), errors="coerce")
+    if pd.isna(d):
+        return x.reset_index(drop=True)
+
+    vals = {}
+    for c in ["open","high","low","close"]:
+        vals[c] = pd.to_numeric(rr.get(c), errors="coerce")
+    vol = pd.to_numeric(rr.get("volume_lots", rr.get("volume")), errors="coerce")
+
+    # 沒有有效 OHLC 就不製造假資料
+    if pd.isna(vals["close"]) or float(vals["close"]) <= 0:
+        return x.reset_index(drop=True)
+    for c in ["open","high","low"]:
+        if pd.isna(vals[c]) or float(vals[c]) <= 0:
+            vals[c] = vals["close"]
+
+    day = pd.Timestamp(d).normalize()
+    row = {
+        "date": day,
+        "open": float(vals["open"]),
+        "high": float(vals["high"]),
+        "low": float(vals["low"]),
+        "close": float(vals["close"]),
+        "volume": float(vol) if pd.notna(vol) else pd.NA,
+    }
+
+    same = x["date"].dt.normalize().eq(day)
+    if same.any():
+        idx = x.index[same][-1]
+        for c,v in row.items():
+            x.loc[idx,c] = v
+    else:
+        x = pd.concat([x, pd.DataFrame([row])], ignore_index=True)
+
+    return x.sort_values("date").drop_duplicates("date", keep="last").reset_index(drop=True)
+
+@st.cache_data(ttl=300, show_spinner=False)
 def build_kd_decline_ranking(stock_records, expected_trade_date=""):
+    """V7.2.4：先篩今日下跌股，再平行抓歷史資料，最後強制驗證連跌>=3。"""
     rows = []
+    stale = 0
+    records = []
+
     for rr in stock_records:
         code = str(rr.get("code","")).strip()
         if not code or not re.fullmatch(r"\d{4}", code):
             continue
-        d = kd_decline_for_code(code)
-        data_date = str(d.get("資料日期","") or "")
-        # 資料日期不等於本次市場最新交易日：直接排除，避免舊資料誤判連跌
-        if expected_trade_date and data_date and data_date != expected_trade_date:
+        chg = pd.to_numeric(rr.get("change"), errors="coerce")
+        if pd.notna(chg) and float(chg) >= 0:
             continue
-        if d.get("符合條件", False):
+        records.append(rr)
+
+    def _calc_one(rr):
+        code = str(rr.get("code","")).strip()
+        try:
+            h = kd_hist_base(code)
+            h = _upsert_today_bar(h, rr, expected_trade_date)
+            d = kd_decline_signal_v617(h)
+            return rr, d
+        except Exception:
+            return rr, None
+
+    results = []
+    if records:
+        max_workers = min(12, max(1, len(records)))
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            futures = [ex.submit(_calc_one, rr) for rr in records]
+            for fut in as_completed(futures):
+                results.append(fut.result())
+
+    for rr, d in results:
+        if d is None:
+            continue
+        code = str(rr.get("code","")).strip()
+        data_date = str(d.get("資料日期","") or "")
+        if expected_trade_date and data_date != expected_trade_date:
+            stale += 1
+            continue
+
+        decline = pd.to_numeric(d.get("連跌日數"), errors="coerce")
+        v3 = pd.to_numeric(d.get("3K-2D"), errors="coerce")
+        if pd.notna(decline) and int(decline) >= 3 and pd.notna(v3) and float(v3) < 0:
             rows.append({"code":code, "name":rr.get("name",""), **d})
 
     if not rows:
-        return pd.DataFrame()
+        out = pd.DataFrame()
+        out.attrs["stale_count"] = stale
+        out.attrs["prefilter_count"] = len(records)
+        return out
 
     out = pd.DataFrame(rows)
-    out["連跌日數"] = pd.to_numeric(out["連跌日數"], errors="coerce").fillna(0)
+    out["連跌日數"] = pd.to_numeric(out["連跌日數"], errors="coerce").fillna(0).astype(int)
     out["K值"] = pd.to_numeric(out["K值"], errors="coerce")
     out["D值"] = pd.to_numeric(out["D值"], errors="coerce")
     out["3K-2D"] = pd.to_numeric(out["3K-2D"], errors="coerce")
+    out = out[(out["連跌日數"] >= 3) & (out["3K-2D"] < 0)].copy()
 
-    # 越負、連跌越久、K值越低，排序越前
     out["弱勢排序分"] = (
         out["連跌日數"].clip(upper=10) * 10
         + (-out["3K-2D"].clip(upper=0)).fillna(0) * 3
         + (20 - out["K值"].clip(lower=0, upper=20)).fillna(0)
     )
-
+    out.attrs["stale_count"] = stale
+    out.attrs["prefilter_count"] = len(records)
     return out.sort_values(
         ["KD超賣","弱勢排序分","連跌日數"],
         ascending=[False,False,False]
@@ -1288,8 +1367,8 @@ def build_unified_ai_ranking(base: pd.DataFrame, weights: dict) -> pd.DataFrame:
     return out.sort_values("AI總分",ascending=False).reset_index(drop=True)
 
 
-APP_VERSION = "V7.2.2"
-APP_BUILD = "顯示函式撞名修正・Arrow序列化修正・交易日同步・KD修正・高速掃描版"
+APP_VERSION = "V7.2.4"
+APP_BUILD = "KD候選預篩・平行抓取・交易日同步・高速掃描版"
 
 cfg = load_cfg()
 st.title(f"📡 個人版台股權證雷達 {APP_VERSION}")
@@ -1474,8 +1553,9 @@ with st.spinner("掃描全市場事件型機會…"):
 with st.spinner("掃描市場過熱股票…"):
     overheat_ranking = build_overheat_ranking(event_pool, max_scan=120)
 
-with st.spinner("掃描全市場連跌＋3K-2D負值股票…"):
-    _kd_records = all_stocks[["code","name"]].to_dict("records") if all_stocks is not None and not all_stocks.empty else []
+with st.spinner("高速掃描連跌＋3K-2D：先篩今日下跌股，再平行計算歷史KD…"):
+    _kd_cols = [c for c in ["code","name","trade_date","open","high","low","close","change","volume_lots","volume"] if c in all_stocks.columns]
+    _kd_records = all_stocks[_kd_cols].to_dict("records") if all_stocks is not None and not all_stocks.empty else []
     kd_decline_ranking = build_kd_decline_ranking(_kd_records, EXPECTED_TRADE_DATE)
 
 # 固定關注股另外計算，不受每日 TOP 排名限制
